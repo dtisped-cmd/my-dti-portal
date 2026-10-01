@@ -1,18 +1,13 @@
 import nodemailer from 'nodemailer';
 
 const getSmtpTransporter = () => {
-  const host = process.env.SMTP_HOST?.trim();
-  const port = Number(process.env.SMTP_PORT || 465);
-  const user = process.env.SMTP_USER?.trim();
-  const pass = process.env.SMTP_PASS?.trim();
-
-  if (!host || !user || !pass || !Number.isFinite(port)) return null;
-
+  // استخدام المعرّف الرسمي لخدمة الجيميل لتفادي أخطاء المنافذ محلياً
   return nodemailer.createTransport({
-    host,
-    port,
-    secure: process.env.SMTP_SECURE === 'true' || port === 465,
-    auth: { user, pass },
+    service: 'gmail',
+    auth: {
+      user: "dtisped@gmail.com",
+      pass: "pucckvikxyqcnqtd",
+    },
   });
 };
 
@@ -21,7 +16,7 @@ const escapeHtml = (value: string | number | null | undefined) => String(value ?
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;')
-  .replace(/'/g, '&#039;');
+  .replace(/'/g, '&#39;');
 
 export async function sendEmail({
   to,
@@ -34,7 +29,7 @@ export async function sendEmail({
 }) {
   const transporter = getSmtpTransporter();
   const recipient = to.trim();
-  const sender = process.env.SMTP_USER?.trim();
+  const sender = "dtisped@gmail.com";
 
   if (!transporter || !sender || !recipient) {
     return { success: false, error: 'smtp-not-configured-or-recipient-missing' };
@@ -66,7 +61,7 @@ export const buildClassChangeEmail = ({
   const safeStudentName = escapeHtml(studentName);
   const safePreviousClass = escapeHtml(previousClass || 'غير محددة');
   const safeNextClass = escapeHtml(nextClass);
-  const logoUrl = 'https://my-dti.netlify.app/institute-logo.png';
+  const logoUrl = 'https://netlify.app';
 
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
