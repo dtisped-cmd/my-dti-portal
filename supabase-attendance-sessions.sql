@@ -9,9 +9,7 @@ create table if not exists public."جلسات الحضور" (
   "الحالة" text not null default 'نشطة'
 );
 
-create unique index if not exists attendance_active_session_key
-  on public."جلسات الحضور" (session_key)
-  where "الحالة" = 'نشطة';
+drop index if exists public.attendance_active_session_key;
 
 alter table public."جلسات الحضور" enable row level security;
 

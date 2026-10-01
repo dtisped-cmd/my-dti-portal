@@ -1,9 +1,11 @@
 'use client';
 
 import Link from 'next/link';
-import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { Code2, Download, Pencil } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { writeAuditLog } from '../lib/auditLog';
+import { teacherEvaluationsTemporarilyDisabled } from '../lib/featureFlags';
 import {
   getClassAvailabilityOptions,
   getStudentById,
@@ -13,7 +15,20 @@ import {
   StudentRow,
 } from '../lib/studentData';
 
-type TabKey = 'grades' | 'record' | 'status' | 'schedule';
+type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills' | 'evaluations';
+
+type StudentSkill = {
+  category: string;
+  detail: string;
+};
+
+type TeacherEntry = {
+  id: string;
+  name: string;
+  subjects: string[];
+};
+
+type TeacherRating = 0 | 1 | 2 | 3 | 4;
 
 type ScheduleItem = {
   id: string | number;
@@ -155,12 +170,65 @@ const getTableRows = async (tableNames: string[], select = '*') => {
 };
 
 const scheduleDays = ['الأحد', 'الأثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
+const skillCategories = ['مونتاج', 'رياضة', 'تصوير', 'تصميم جرافيكي', 'برمجة', 'رسم', 'كتابة', 'لغات', 'موسيقى', 'تطوع', 'أخرى'];
+const sportTypes = ['كرة القدم', 'كرة السلة', 'كرة الطائرة', 'السباحة', 'الجري', 'رياضة أخرى'];
+const teacherRatingOptions: Array<{ value: TeacherRating; label: string }> = [
+  { value: 4, label: 'رائع' },
+  { value: 3, label: 'جيد' },
+  { value: 2, label: 'مقبول' },
+  { value: 1, label: 'سيئ' },
+  { value: 0, label: 'لا أعلم' },
+];
 
 const formatScheduleTime = (value: unknown) => String(value ?? '').slice(0, 5);
 
 const getStudentGroup = (student: Record<string, unknown> | null | undefined) => String(
   student?.['الفئة'] ?? student?.group ?? student?.group_name ?? ''
 ).trim().replace(/^فئة\s*/i, '');
+
+/* ============================================================
+   Click Sound + Press Feedback Utilities
+   ============================================================ */
+
+const createClickSound = () => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const AudioContextCtor = (window as unknown as { AudioContext?: typeof AudioContext; webkitAudioContext?: typeof AudioContext }).AudioContext
+      || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return null;
+    const ctx = new AudioContextCtor();
+
+    return () => {
+      try {
+        if (ctx.state === 'suspended') void ctx.resume();
+        const now = ctx.currentTime;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.exponentialRampToValueAtTime(420, now + 0.06);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.13, now + 0.005);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.09);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.1);
+      } catch {
+        /* ignore */
+      }
+    };
+  } catch {
+    return null;
+  }
+};
+
+let playClickSound: (() => void) | null = null;
+
+const initClickSound = () => {
+  if (playClickSound) return;
+  playClickSound = createClickSound();
+};
 
 export default function Home() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -173,6 +241,28 @@ export default function Home() {
   const [grades, setGrades] = useState<GradeEntry[]>([]);
   const [warnings, setWarnings] = useState<Record<string, unknown>[]>([]);
   const [scheduleItems, setScheduleItems] = useState<ScheduleItem[]>([]);
+  const [studentSkills, setStudentSkills] = useState<StudentSkill[]>([]);
+  const [skillDrafts, setSkillDrafts] = useState<StudentSkill[]>([]);
+  const [isEditingSkills, setIsEditingSkills] = useState(false);
+  const [isSavingSkills, setIsSavingSkills] = useState(false);
+  const [skillsMessage, setSkillsMessage] = useState('');
+  const [showProfileCompletion, setShowProfileCompletion] = useState(true);
+  const [teacherEvaluationLoading, setTeacherEvaluationLoading] = useState(false);
+  const [teacherEvaluationReady, setTeacherEvaluationReady] = useState(false);
+  const [teacherEvaluationRequired, setTeacherEvaluationRequired] = useState(false);
+  const [teacherEvaluationError, setTeacherEvaluationError] = useState('');
+  const [teachers, setTeachers] = useState<TeacherEntry[]>([]);
+  const [teacherRatingDrafts, setTeacherRatingDrafts] = useState<Record<string, TeacherRating>>({});
+  const [teacherRatingNotes, setTeacherRatingNotes] = useState<Record<string, string>>({});
+  const [savedTeacherRatings, setSavedTeacherRatings] = useState<Record<string, TeacherRating>>({});
+  const [savedTeacherNotes, setSavedTeacherNotes] = useState<Record<string, string>>({});
+  const [savingTeacherRatingKey, setSavingTeacherRatingKey] = useState<string | null>(null);
+  const [teacherRatingNotice, setTeacherRatingNotice] = useState('');
+  const studentDashboardRef = useRef<HTMLDivElement>(null);
+  const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
+  const [avatarNotice, setAvatarNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [isExportingQr, setIsExportingQr] = useState(false);
+  const [qrExportError, setQrExportError] = useState('');
   const [studentStatus, setStudentStatus] = useState<string>('غير متوفر');
   const [classOptions, setClassOptions] = useState<Array<{ name: string; capacity: number | null; occupied: number; available: number | null }>>([]);
   const [selectedClassForUpdate, setSelectedClassForUpdate] = useState('');
@@ -196,7 +286,304 @@ export default function Home() {
   const [resetCode, setResetCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [resetLoading, setResetLoading] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState(true);
   const hasStudentGroup = Boolean(getStudentGroup(loggedStudent as Record<string, unknown> | null));
+  const getStudentNamePart = (keys: string[]) => keys
+    .map((key) => String((loggedStudent as Record<string, unknown> | null)?.[key] ?? '').trim())
+    .find((part) => part && part !== '.' && part !== 'غير متوفر') ?? '';
+  const studentFullName = [
+    getStudentNamePart(['اسم الطالب', 'name', 'student_name']),
+    getStudentNamePart(['اسم الاب', 'اسم الأب', 'father_name']),
+    getStudentNamePart(['الكنية', 'family_name', 'surname']),
+  ].filter(Boolean).join(' ') || 'اسم الطالب';
+  const studentQrId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+  const studentQrData = `UDTI|${studentFullName}|${studentQrId}`;
+  const studentQrHighResolutionUrl = `https://api.qrserver.com/v1/create-qr-code/?size=1000x1000&data=${encodeURIComponent(studentQrData)}`;
+  const teacherEvaluationGateOpen = isLoggedIn && (!teacherEvaluationReady || teacherEvaluationRequired);
+
+  useEffect(() => {
+    const dashboard = studentDashboardRef.current;
+    if (!dashboard) return;
+    if (teacherEvaluationGateOpen) dashboard.setAttribute('inert', '');
+    else dashboard.removeAttribute('inert');
+  }, [teacherEvaluationGateOpen]);
+  const profileChecklist = [
+    { label: 'الصورة الشخصية', weight: 30, complete: Boolean(loggedStudent?.avatar_url) },
+    { label: 'إضافة مهارة', weight: 30, complete: studentSkills.length > 0 },
+    { label: 'تغيير الرقم الجامعي', weight: 30, complete: studentIdChangeCompleted },
+    { label: 'إشعارات تيليجرام', weight: 10, complete: telegramNotificationsEnabled },
+  ];
+  const profileCompletion = profileChecklist.reduce(
+    (total, task) => total + (task.complete ? task.weight : 0),
+    0
+  );
+  const missingProfileTasks = profileChecklist.filter((task) => !task.complete).map((task) => task.label);
+  const getTeacherRatingKey = (teacherId: string, subject: string) => `${teacherId}::${subject}`;
+  const teacherEvaluationTasks = teachers.flatMap((teacher) => teacher.subjects.map((subject) => ({
+    teacher,
+    subject,
+    key: getTeacherRatingKey(teacher.id, subject),
+  })));
+  const pendingTeacherEvaluationCount = teacherEvaluationTasks.filter((task) => savedTeacherRatings[task.key] === undefined).length;
+
+  useEffect(() => {
+    if (teacherEvaluationsTemporarilyDisabled || !isLoggedIn || !studentQrId) {
+      setTeacherEvaluationLoading(false);
+      setTeacherEvaluationReady(false);
+      setTeacherEvaluationRequired(false);
+      setTeacherEvaluationError('');
+      setTeachers([]);
+      setTeacherRatingDrafts({});
+      setTeacherRatingNotes({});
+      setSavedTeacherRatings({});
+      setSavedTeacherNotes({});
+      if (isLoggedIn && teacherEvaluationsTemporarilyDisabled) setTeacherEvaluationReady(true);
+      return;
+    }
+
+    let cancelled = false;
+    setTeacherEvaluationReady(false);
+    setTeacherEvaluationRequired(false);
+    setTeacherEvaluationLoading(true);
+    setTeacherEvaluationError('');
+    setTeacherRatingNotice('');
+
+    const loadTeacherEvaluations = async () => {
+      try {
+        const response = await fetch('/api/student/teacher-evaluations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'load',
+            studentId: studentQrId,
+            password: String(loggedStudent?.['كلمة السر'] ?? loggedStudent?.password ?? ''),
+          }),
+        });
+        const result = await response.json() as {
+          success?: boolean;
+          enabled?: boolean;
+          error?: string;
+          teachers?: Array<Record<string, unknown>>;
+          ratings?: Array<Record<string, unknown>>;
+        };
+        if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-load-failed');
+        if (cancelled) return;
+
+        if (!result.enabled) {
+          setTeacherEvaluationReady(true);
+          setTeacherEvaluationRequired(false);
+          setTeachers([]);
+          setTeacherRatingDrafts({});
+          setTeacherRatingNotes({});
+          setSavedTeacherRatings({});
+          setSavedTeacherNotes({});
+          setTeacherEvaluationError('');
+          setActiveTab((current) => current === 'evaluations' ? 'record' : current);
+          return;
+        }
+
+        setTeacherEvaluationRequired(true);
+        setActiveTab('evaluations');
+        const teacherRows = Array.isArray(result.teachers) ? result.teachers : [];
+        const loadedTeachers = teacherRows.flatMap((row) => {
+          const id = String(row.id ?? '').trim();
+          const name = String(row.teacher_name ?? '').trim();
+          const subjects = Array.isArray(row.subjects)
+            ? [...new Set(row.subjects.map((subject) => String(subject).trim()).filter(Boolean))]
+            : [];
+          return id && name ? [{ id, name, subjects }] : [];
+        });
+        if (!loadedTeachers.length || loadedTeachers.some((teacher) => teacher.subjects.length === 0)) {
+          throw new Error('لم تتم إضافة مدرسين مع مقرراتهم. أضف مدرسًا ومادة واحدة على الأقل لكل مدرس من جدول teachers.');
+        }
+        setTeachers(loadedTeachers);
+
+        const ratingRows = Array.isArray(result.ratings) ? result.ratings : [];
+        const storedRatings: Record<string, TeacherRating> = {};
+        const storedNotes: Record<string, string> = {};
+        ratingRows.forEach((row) => {
+          const teacherId = String(row.teacher_id ?? '');
+          const subject = String(row.subject ?? '');
+          const rating = Number(row.rating);
+          if (teacherId && subject && [0, 1, 2, 3, 4].includes(rating)) {
+            storedRatings[getTeacherRatingKey(teacherId, subject)] = rating as TeacherRating;
+            storedNotes[getTeacherRatingKey(teacherId, subject)] = String(row.note ?? '');
+          }
+        });
+        setSavedTeacherRatings(storedRatings);
+        setSavedTeacherNotes(storedNotes);
+        setTeacherRatingDrafts(storedRatings);
+        setTeacherRatingNotes(storedNotes);
+        const pendingCount = loadedTeachers.reduce((total, teacher) => (
+          total + teacher.subjects.filter((subject) => storedRatings[getTeacherRatingKey(teacher.id, subject)] === undefined).length
+        ), 0);
+        setTeacherEvaluationRequired(pendingCount > 0);
+        setTeacherEvaluationReady(true);
+        setTeacherEvaluationError('');
+        setActiveTab(pendingCount > 0 ? 'evaluations' : 'record');
+      } catch (error) {
+        if (!cancelled) {
+          const errorDetail = error instanceof Error ? error.message : String(error);
+          const errorMessage = errorDetail.includes('teacher-evaluation-server-key-missing')
+            ? 'يجب إعداد SUPABASE_SERVICE_ROLE_KEY في بيئة الخادم لتفعيل بوابة التقييم السرية.'
+            : `تعذر تحميل التقييمات: ${errorDetail}`;
+          setTeacherEvaluationRequired(true);
+          setTeacherEvaluationReady(true);
+          setTeacherEvaluationError(errorMessage);
+          setActiveTab('evaluations');
+        }
+      } finally {
+        if (!cancelled) setTeacherEvaluationLoading(false);
+      }
+    };
+
+    void loadTeacherEvaluations();
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoggedIn, studentQrId]);
+
+  const saveTeacherRating = async (teacher: TeacherEntry, subject: string) => {
+    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+    const key = getTeacherRatingKey(teacher.id, subject);
+    const rating = teacherRatingDrafts[key];
+    if (!studentId || rating === undefined) return;
+
+    setSavingTeacherRatingKey(key);
+    setTeacherRatingNotice('');
+    try {
+      const response = await fetch('/api/student/teacher-evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'save',
+          studentId,
+          password: String(loggedStudent?.['كلمة السر'] ?? loggedStudent?.password ?? ''),
+          teacherId: teacher.id,
+          subject,
+          rating,
+          note: teacherRatingNotes[key]?.trim() ?? '',
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string };
+      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-save-failed');
+
+      const nextRatings = { ...savedTeacherRatings, [key]: rating };
+      setSavedTeacherRatings(nextRatings);
+      setSavedTeacherNotes((current) => ({ ...current, [key]: teacherRatingNotes[key]?.trim() ?? '' }));
+      const pendingCount = teachers.reduce((total, currentTeacher) => (
+        total + currentTeacher.subjects.filter((currentSubject) => (
+          nextRatings[getTeacherRatingKey(currentTeacher.id, currentSubject)] === undefined
+        )).length
+      ), 0);
+      setTeacherEvaluationRequired(pendingCount > 0);
+      setTeacherRatingNotice(pendingCount === 0 ? 'شكرًا، اكتملت جميع التقييمات.' : 'تم حفظ التقييم. أكمل تقييم بقية المقررات.');
+      if (pendingCount === 0) setActiveTab('record');
+    } catch {
+      setTeacherRatingNotice('تعذر حفظ التقييم. شغّل تحديث SQL وتحقق من سياسات جدول تقييم المدرسين.');
+    } finally {
+      setSavingTeacherRatingKey(null);
+    }
+  };
+
+  useEffect(() => {
+    if (profileCompletion < 100) {
+      setShowProfileCompletion(true);
+      return;
+    }
+
+    const hideCompletionMessage = window.setTimeout(() => setShowProfileCompletion(false), 2000);
+    return () => window.clearTimeout(hideCompletionMessage);
+  }, [profileCompletion]);
+
+  /* ============================================================
+     Click Sound: تهيئة + تشغيل تلقائي عند أي ضغطة على زر/رابط
+     ============================================================ */
+
+  useEffect(() => {
+    const handleFirstInteraction = () => {
+      initClickSound();
+      window.removeEventListener('pointerdown', handleFirstInteraction);
+    };
+    window.addEventListener('pointerdown', handleFirstInteraction, { once: true });
+    return () => window.removeEventListener('pointerdown', handleFirstInteraction);
+  }, []);
+
+  useEffect(() => {
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      const button = target.closest('button, a, [role="button"], .tab, .logout-button, .login-button, .toggle-password, .forgot-password-button');
+      if (!button) return;
+
+      if (soundEnabled) {
+        if (!playClickSound) initClickSound();
+        playClickSound?.();
+      }
+
+      (button as HTMLElement).classList.add('btn-pressed');
+      window.setTimeout(() => {
+        (button as HTMLElement).classList.remove('btn-pressed');
+      }, 130);
+    };
+
+    document.addEventListener('click', handleClick, true);
+    return () => document.removeEventListener('click', handleClick, true);
+  }, [soundEnabled]);
+
+  /* ============================================================
+     Scroll Reveal Animation (IntersectionObserver + GPU transforms)
+     ============================================================ */
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const selector = [
+      '.student-brand-center',
+      '.student-qr-section',
+      '.student-info',
+      '.student-class-manager',
+      '.student-id-change-manager',
+      '.student-details-grid',
+      '.tabs-container',
+      '.student-footer-actions',
+      '.last-updated',
+      '.info-item',
+      '.detail-item',
+      '.status-card',
+      '.warning-item',
+      '.login-card',
+      '.password-reset-panel',
+      '.login-help',
+      '.system-notice',
+    ].join(', ');
+
+    const elements = Array.from(document.querySelectorAll<HTMLElement>(selector));
+
+    elements.forEach((el) => {
+      el.classList.add('reveal-on-scroll');
+      // stagger بسيط جداً، بحد أقصى 180ms
+      const parent = el.parentElement;
+      const index = parent ? Array.from(parent.children).indexOf(el) : 0;
+      el.style.transitionDelay = `${Math.min(Math.max(index, 0) * 25, 180)}ms`;
+    });
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('revealed');
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.06, rootMargin: '0px 0px -30px 0px' }
+    );
+
+    elements.forEach((el) => observer.observe(el));
+
+    return () => observer.disconnect();
+  }, [isLoggedIn, activeTab]);
 
   const getStudentTelegramChatId = (student: any) => {
     const value = student?.telegram_chat_id ?? student?.['telegram_chat_id'];
@@ -368,6 +755,7 @@ export default function Home() {
     { key: 'record', label: 'السجل' },
     { key: 'status', label: 'الحالة' },
     ...(hasStudentGroup ? [{ key: 'schedule' as const, label: 'برنامج الدوام' }] : []),
+    { key: 'skills', label: 'مهاراتي' },
   ];
 
   useEffect(() => {
@@ -406,7 +794,7 @@ export default function Home() {
     const studentId = String(loggedStudent['الرقم الجامعي']);
 
     try {
-      const [studentResult, warningsResult, gradesResult, scheduleResult] = await Promise.all([
+      const [studentResult, warningsResult, gradesResult, scheduleResult, skillsResult] = await Promise.all([
         getStudentById(studentId),
         getWarningsForStudent(studentId).then((rows) => ({ data: rows })),
         getTableRows(['الاعمال', 'الأعمال', 'أعمال', 'العملي', 'النظري']).then(({ data }) => ({
@@ -419,6 +807,7 @@ export default function Home() {
         hasStudentGroup
           ? supabase.from('schedule_items').select('id, day, start_time, end_time, subject, type, location, group_name')
           : Promise.resolve({ data: [], error: null }),
+        supabase.from('student_skills').select('skills').eq('student_id', studentId).maybeSingle(),
       ]);
 
       const freshStudent = studentResult ?? loggedStudent;
@@ -429,6 +818,21 @@ export default function Home() {
       const gradeRows = gradesResult.data.flatMap((row) => extractGrades([row as unknown as Record<string, unknown>]));
       setGrades(gradeRows);
       setWarnings(warningsResult.data as unknown as Record<string, unknown>[]);
+      if (!skillsResult.error) {
+        const storedSkills = (skillsResult.data as { skills?: unknown } | null)?.skills;
+        const normalizedSkills = Array.isArray(storedSkills)
+          ? storedSkills.filter((skill): skill is StudentSkill => (
+            !!skill
+            && typeof skill === 'object'
+            && typeof (skill as StudentSkill).category === 'string'
+            && typeof (skill as StudentSkill).detail === 'string'
+          )).slice(0, 3)
+          : [];
+        setStudentSkills(normalizedSkills);
+        setSkillsMessage('');
+      } else {
+        setSkillsMessage('تعذر تحميل المهارات. تأكد من تشغيل ملف SQL الخاص بجدول مهارات الطلاب في Supabase.');
+      }
       const currentGroup = getStudentGroup(freshStudent as Record<string, unknown>);
       if (!scheduleResult.error) {
         const matchingSchedule = (Array.isArray(scheduleResult.data) ? scheduleResult.data : [])
@@ -451,6 +855,322 @@ export default function Home() {
       setNotice('حدث خطأ أثناء تحديث البيانات من قاعدة البيانات');
     }
   }, [loggedStudent]);
+
+  const toggleSkillCategory = (category: string) => {
+    setSkillDrafts((current) => {
+      const existingSkill = current.find((skill) => skill.category === category);
+      if (existingSkill) return current.filter((skill) => skill.category !== category);
+      if (current.length >= 3) {
+        setToast({ message: 'يمكنك اختيار ثلاث مهارات كحد أقصى', type: 'info' });
+        return current;
+      }
+      return [...current, { category, detail: '' }];
+    });
+  };
+
+  const updateSkillDetail = (category: string, detail: string) => {
+    setSkillDrafts((current) => current.map((skill) => (
+      skill.category === category ? { ...skill, detail } : skill
+    )));
+  };
+
+  const saveStudentSkills = async () => {
+    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+    if (!studentId) return;
+    if (skillDrafts.length < 1 || skillDrafts.length > 3) {
+      setToast({ message: 'اختر مهارة واحدة على الأقل وثلاث مهارات كحد أقصى', type: 'error' });
+      return;
+    }
+    if (skillDrafts.some((skill) => ['رياضة', 'أخرى'].includes(skill.category) && !skill.detail.trim())) {
+      setToast({ message: 'يرجى تحديد نوع الرياضة أو كتابة المهارة الأخرى', type: 'error' });
+      return;
+    }
+
+    setIsSavingSkills(true);
+    const { error } = await supabase.from('student_skills').upsert({
+      student_id: studentId,
+      name: [
+        getRecordValue(loggedStudent as Record<string, unknown>, ['اسم الطالب', 'name']),
+        getRecordValue(loggedStudent as Record<string, unknown>, ['اسم الاب', 'اسم الأب']),
+        getRecordValue(loggedStudent as Record<string, unknown>, ['الكنية']),
+      ].map((value) => String(value ?? '').trim()).filter(Boolean).join(' '),
+      phone: String(getRecordValue(loggedStudent as Record<string, unknown>, ['رقم الهاتف', 'phone']) ?? '').trim(),
+      skills: skillDrafts.map((skill) => ({ ...skill, detail: skill.detail.trim() })),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'student_id' });
+    setIsSavingSkills(false);
+
+    if (error) {
+      setToast({ message: 'تعذر حفظ المهارات. تأكد من إنشاء الجدول وسياسات الوصول في Supabase.', type: 'error' });
+      return;
+    }
+
+    setStudentSkills(skillDrafts.map((skill) => ({ ...skill, detail: skill.detail.trim() })));
+    setIsEditingSkills(false);
+    setSkillsMessage('');
+    setToast({ message: 'تم حفظ مهاراتك بنجاح', type: 'success' });
+  };
+
+  const compressStudentAvatar = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      throw new Error('الملف المحدد ليس صورة صالحة.');
+    }
+
+    const imageUrl = URL.createObjectURL(file);
+    try {
+      const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const loadedImage = new Image();
+        loadedImage.onload = () => resolve(loadedImage);
+        loadedImage.onerror = () => reject(new Error('تعذر قراءة الصورة. اختر ملف صورة صالحاً.'));
+        loadedImage.src = imageUrl;
+      });
+
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('تعذر تجهيز الصورة في هذا المتصفح.');
+
+      const sourceLongestSide = Math.max(image.naturalWidth, image.naturalHeight);
+      const dimensions = [1600, 1280, 1024, 800, 640, 512, 384, 256]
+        .map((dimension) => Math.min(dimension, sourceLongestSide))
+        .filter((dimension, index, allDimensions) => allDimensions.indexOf(dimension) === index);
+      const qualities = [0.84, 0.76, 0.68, 0.6, 0.52, 0.44, 0.36];
+      const canvasToBlob = (type: string, quality: number) => new Promise<Blob | null>((resolve) => {
+        canvas.toBlob(resolve, type, quality);
+      });
+
+      for (const dimension of dimensions) {
+        const scale = Math.min(1, dimension / sourceLongestSide);
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+        for (const quality of qualities) {
+          const webpBlob = await canvasToBlob('image/webp', quality);
+          if (webpBlob?.type === 'image/webp' && webpBlob.size <= 300 * 1024) return webpBlob;
+
+          if (!webpBlob || webpBlob.type !== 'image/webp') {
+            const jpegBlob = await canvasToBlob('image/jpeg', quality);
+            if (jpegBlob?.type === 'image/jpeg' && jpegBlob.size <= 300 * 1024) return jpegBlob;
+          }
+        }
+      }
+
+      throw new Error('تعذر ضغط الصورة إلى الحجم المطلوب. جرّب صورة أخرى.');
+    } finally {
+      URL.revokeObjectURL(imageUrl);
+    }
+  };
+
+  const uploadStudentAvatar = async (file: File) => {
+    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+    if (!studentId) return;
+
+    if (isUploadingAvatar) return;
+
+    if (!file.type.startsWith('image/')) {
+      setAvatarNotice({ message: 'الملف المحدد ليس صورة. اختر صورة صالحة.', type: 'error' });
+      return;
+    }
+
+    setIsUploadingAvatar(true);
+    setAvatarNotice(null);
+    let uploadedPath = '';
+
+    try {
+      const compressedFile = await compressStudentAvatar(file);
+      const extension = compressedFile.type === 'image/webp' ? 'webp' : 'jpg';
+      const safeStudentId = studentId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const filePath = `${safeStudentId}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+      const { data: uploadedFile, error: uploadError } = await supabase.storage
+        .from('avatars')
+        .upload(filePath, compressedFile, { contentType: compressedFile.type, cacheControl: '3600', upsert: false });
+
+      if (uploadError || !uploadedFile) {
+        throw new Error('تعذر رفع الصورة إلى مساحة التخزين. تحقق من إعدادات وسياسات Bucket avatars.');
+      }
+      uploadedPath = uploadedFile.path;
+
+      const { data: publicUrlData } = supabase.storage.from('avatars').getPublicUrl(uploadedFile.path);
+      const avatarUrl = publicUrlData.publicUrl;
+      const { data: updatedStudent, error: updateError } = await supabase
+        .from('students')
+        .update({ avatar_url: avatarUrl })
+        .eq('الرقم الجامعي', studentId)
+        .select('avatar_url')
+        .maybeSingle();
+
+      if (updateError || !updatedStudent) {
+        await supabase.storage.from('avatars').remove([uploadedPath]);
+        uploadedPath = '';
+        throw new Error('تم رفع الصورة لكن تعذر حفظ رابطها في سجل الطالب. تحقق من عمود avatar_url وصلاحية التحديث.');
+      }
+
+      setLoggedStudent((current) => current ? { ...current, avatar_url: avatarUrl } : current);
+      setAvatarNotice({ message: 'تم تحديث الصورة الشخصية بنجاح.', type: 'success' });
+    } catch (error) {
+      if (uploadedPath) await supabase.storage.from('avatars').remove([uploadedPath]);
+      setAvatarNotice({
+        message: error instanceof Error ? error.message : 'حدث خطأ غير متوقع أثناء رفع الصورة.',
+        type: 'error',
+      });
+    } finally {
+      setIsUploadingAvatar(false);
+    }
+  };
+
+  const loadHighResolutionQrImage = () => new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new window.Image();
+    image.crossOrigin = 'anonymous';
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('تعذر تحميل الباركود عالي الدقة. تحقق من اتصال الإنترنت.'));
+    image.src = studentQrHighResolutionUrl;
+  });
+
+  const createStudentQrCanvas = async () => {
+    const qrImage = await loadHighResolutionQrImage();
+    const canvas = document.createElement('canvas');
+    canvas.width = 1400;
+    canvas.height = 1300;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('تعذر تجهيز ملف الباركود في هذا المتصفح.');
+
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.textAlign = 'center';
+    context.direction = 'rtl';
+    context.fillStyle = '#173d35';
+    context.font = 'bold 48px Arial, sans-serif';
+    context.fillText('المعهد التقاني لطب الأسنان', 700, 150);
+    context.drawImage(qrImage, 390, 245, 620, 620);
+
+    let nameFontSize = 58;
+    context.font = `bold ${nameFontSize}px Arial, sans-serif`;
+    while (context.measureText(studentFullName).width > 880 && nameFontSize > 38) {
+      nameFontSize -= 2;
+      context.font = `bold ${nameFontSize}px Arial, sans-serif`;
+    }
+    context.fillStyle = '#172b25';
+    context.fillText(studentFullName, 700, 930, 880);
+    context.font = 'bold 48px Arial, sans-serif';
+    context.fillText(`الرقم الجامعي: ${studentQrId}`, 700, 1000, 880);
+    context.fillStyle = '#0f513f';
+    context.font = 'bold 48px Arial, sans-serif';
+    context.fillText('يرجى طباعته على ورقة كرتونية', 700, 1195, 1280);
+    return canvas;
+  };
+
+  const downloadBlob = (blob: Blob, fileName: string) => {
+    const downloadUrl = URL.createObjectURL(blob);
+    const downloadLink = document.createElement('a');
+    downloadLink.href = downloadUrl;
+    downloadLink.download = fileName;
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    downloadLink.remove();
+    window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+  };
+
+  const createStudentQrPdf = async (canvas: HTMLCanvasElement) => {
+    const jpegBlob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.98));
+    if (!jpegBlob) throw new Error('تعذر تجهيز محتوى ملف PDF.');
+
+    const imageBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+    const encoder = new TextEncoder();
+    const parts: Uint8Array[] = [];
+    const offsets = [0, 0, 0, 0, 0, 0];
+    let byteLength = 0;
+    const appendBytes = (bytes: Uint8Array) => {
+      parts.push(bytes);
+      byteLength += bytes.byteLength;
+    };
+    const appendText = (text: string) => appendBytes(encoder.encode(text));
+    const addObject = (objectNumber: number, body: string) => {
+      offsets[objectNumber] = byteLength;
+      appendText(`${objectNumber} 0 obj\n${body}\nendobj\n`);
+    };
+
+    appendText('%PDF-1.4\n');
+    addObject(1, '<< /Type /Catalog /Pages 2 0 R >>');
+    addObject(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+    addObject(3, '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>');
+
+    offsets[4] = byteLength;
+    appendText(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${canvas.width} /Height ${canvas.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${imageBytes.byteLength} >>\nstream\n`);
+    appendBytes(imageBytes);
+    appendText('\nendstream\nendobj\n');
+
+    const pageWidth = 595.28;
+    const pageHeight = 841.89;
+    const pageImageWidth = 315;
+    const pageImageHeight = pageImageWidth * (canvas.height / canvas.width);
+    const imageScale = pageImageWidth / canvas.width;
+    const imageX = pageWidth - pageImageWidth - 36;
+    const imageY = pageHeight - pageImageHeight - 36;
+    const frameWidth = 1000 * imageScale;
+    const frameHeight = frameWidth;
+    const frameX = imageX + 200 * imageScale;
+    const frameY = imageY + pageImageHeight - (60 + 1000) * imageScale;
+    const scissorsX = frameX - 42;
+    const scissorsY = frameY + frameHeight / 2;
+    const circlePath = (centerX: number, centerY: number, radius: number) => {
+      const control = radius * 0.5523;
+      return `${(centerX + radius).toFixed(2)} ${centerY.toFixed(2)} m ${(centerX + radius).toFixed(2)} ${(centerY + control).toFixed(2)} ${(centerX + control).toFixed(2)} ${(centerY + radius).toFixed(2)} ${centerX.toFixed(2)} ${(centerY + radius).toFixed(2)} c ${(centerX - control).toFixed(2)} ${(centerY + radius).toFixed(2)} ${(centerX - radius).toFixed(2)} ${(centerY + control).toFixed(2)} ${(centerX - radius).toFixed(2)} ${centerY.toFixed(2)} c ${(centerX - radius).toFixed(2)} ${(centerY - control).toFixed(2)} ${(centerX - control).toFixed(2)} ${(centerY - radius).toFixed(2)} ${centerX.toFixed(2)} ${(centerY - radius).toFixed(2)} c ${(centerX + control).toFixed(2)} ${(centerY - radius).toFixed(2)} ${(centerX + radius).toFixed(2)} ${(centerY - control).toFixed(2)} ${(centerX + radius).toFixed(2)} ${centerY.toFixed(2)} c S`;
+    };
+    const pageContent = [
+      'q',
+      'q',
+      `${pageImageWidth.toFixed(2)} 0 0 ${pageImageHeight.toFixed(2)} ${imageX.toFixed(2)} ${imageY.toFixed(2)} cm`,
+      '/Im0 Do',
+      'Q',
+      '0.05 0.20 0.16 RG',
+      '1.6 w',
+      '[1 2] 0 d',
+      `${frameX.toFixed(2)} ${frameY.toFixed(2)} ${frameWidth.toFixed(2)} ${frameHeight.toFixed(2)} re S`,
+      '[] 0 d',
+      '2.2 w',
+      circlePath(scissorsX + 6, scissorsY - 7, 5.5),
+      circlePath(scissorsX + 6, scissorsY + 7, 5.5),
+      `${(scissorsX + 12).toFixed(2)} ${(scissorsY - 4).toFixed(2)} m ${(scissorsX + 33).toFixed(2)} ${(scissorsY + 14).toFixed(2)} l S`,
+      `${(scissorsX + 12).toFixed(2)} ${(scissorsY + 4).toFixed(2)} m ${(scissorsX + 33).toFixed(2)} ${(scissorsY - 14).toFixed(2)} l S`,
+      'Q',
+    ].join('\n');
+    const pageContentBytes = encoder.encode(pageContent);
+    offsets[5] = byteLength;
+    appendText(`5 0 obj\n<< /Length ${pageContentBytes.byteLength} >>\nstream\n`);
+    appendBytes(pageContentBytes);
+    appendText('\nendstream\nendobj\n');
+
+    const crossReferenceOffset = byteLength;
+    appendText('xref\n0 6\n0000000000 65535 f \n');
+    for (let objectNumber = 1; objectNumber <= 5; objectNumber += 1) {
+      appendText(`${String(offsets[objectNumber]).padStart(10, '0')} 00000 n \n`);
+    }
+    appendText(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${crossReferenceOffset}\n%%EOF`);
+
+    const pdfBytes = new Uint8Array(byteLength);
+    let offset = 0;
+    parts.forEach((part) => {
+      pdfBytes.set(part, offset);
+      offset += part.byteLength;
+    });
+    return new Blob([pdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
+  };
+
+  const downloadStudentQrPdf = async () => {
+    setIsExportingQr(true);
+    setQrExportError('');
+
+    try {
+      const canvas = await createStudentQrCanvas();
+      const pdfBlob = await createStudentQrPdf(canvas);
+      downloadBlob(pdfBlob, `student-${studentQrId || 'qr'}.pdf`);
+    } catch (error) {
+      setQrExportError(error instanceof Error ? error.message : 'حدث خطأ أثناء إنشاء ملف PDF.');
+    } finally {
+      setIsExportingQr(false);
+    }
+  };
 
   useEffect(() => {
     if (!loggedStudent || !loggedStudent['الرقم الجامعي']) return;
@@ -519,6 +1239,9 @@ export default function Home() {
         telegram_notifications_enabled: preference
       } as StudentRow;
 
+      setStudentSkills([]);
+      setSkillDrafts([]);
+      setIsEditingSkills(false);
       setLoggedStudent(hydratedUser);
       setTelegramNotificationsEnabled(preference);
       setActiveTab('record');
@@ -753,6 +1476,9 @@ export default function Home() {
     window.localStorage.removeItem(studentSessionStorageKey);
     setIsLoggedIn(false);
     setLoggedStudent(null);
+    setStudentSkills([]);
+    setSkillDrafts([]);
+    setIsEditingSkills(false);
     setLoginData({ studentId: '', password: '' });
     setNewStudentId('');
     setStudentIdChangeConfirmed(false);
@@ -766,7 +1492,6 @@ export default function Home() {
         className="login-shell"
         dir="rtl"
         style={{
-          backgroundImage: "linear-gradient(rgba(10, 19, 17, 0.42), rgba(10, 19, 17, 0.42)), url('/building.jpg')",
           backgroundSize: 'cover',
           backgroundPosition: 'center center',
           backgroundRepeat: 'no-repeat',
@@ -950,7 +1675,7 @@ export default function Home() {
   return (
     <main className="student-shell" dir="rtl">
       <div className="student-page">
-        <div className="container student-dashboard-container" id="mainContainer">
+        <div ref={studentDashboardRef} className="container student-dashboard-container" id="mainContainer" aria-hidden={teacherEvaluationGateOpen}>
           <div className="student-brand-center student-identity-hero">
             <img
               className="institute-logo"
@@ -963,28 +1688,153 @@ export default function Home() {
             </div>
           </div>
 
+          <section className="student-avatar-section" aria-label="الصورة الشخصية">
+            <div className="student-avatar-frame">
+              <input
+                id="student-avatar-file"
+                className="student-avatar-file"
+                type="file"
+                accept="image/*"
+                disabled={isUploadingAvatar}
+                onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = '';
+                  if (file) void uploadStudentAvatar(file);
+                }}
+              />
+              {loggedStudent?.avatar_url ? (
+                <img
+                  className="student-avatar-image"
+                  src={loggedStudent.avatar_url}
+                  alt={`الصورة الشخصية للطالب ${studentFullName}`}
+                />
+              ) : (
+                <div className="student-avatar-placeholder" role="img" aria-label="لا توجد صورة شخصية">
+                  <i className="fa-solid fa-user" aria-hidden="true" />
+                </div>
+              )}
+              <label
+                className={`student-avatar-camera-button${isUploadingAvatar ? ' is-uploading' : ''}`}
+                htmlFor="student-avatar-file"
+                aria-label="تعديل الصورة الشخصية"
+                title="تعديل الصورة الشخصية"
+              >
+                {isUploadingAvatar ? <span className="student-avatar-spinner" aria-hidden="true" /> : <Pencil size={17} strokeWidth={2.5} aria-hidden="true" />}
+              </label>
+            </div>
+            <div className="student-avatar-controls">
+              <strong className="student-avatar-name">{studentFullName}</strong>
+              {isUploadingAvatar && <span className="student-avatar-hint">جارٍ ضغط الصورة ورفعها...</span>}
+              {avatarNotice && (
+                <span className={`student-avatar-notice ${avatarNotice.type}`} role="status" aria-live="polite">
+                  {avatarNotice.message}
+                </span>
+              )}
+            </div>
+          </section>
+
+          {showProfileCompletion && (
+            <div className="student-profile-completion-wrap">
+              <section
+                className={`student-profile-completion${profileCompletion === 100 ? ' is-fading' : ''}`}
+                aria-labelledby="student-profile-completion-title"
+                aria-hidden={profileCompletion === 100}
+              >
+              <div className="student-profile-completion-heading">
+                <h2 id="student-profile-completion-title">اكتمال الملف الشخصي</h2>
+                <strong>{profileCompletion}%</strong>
+              </div>
+              <div
+                className="student-profile-completion-track"
+                role="progressbar"
+                aria-label="نسبة اكتمال الملف الشخصي"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={profileCompletion}
+              >
+                <span style={{ width: `${profileCompletion}%` }} />
+              </div>
+              <p className="student-profile-completion-hint">
+                المتبقي لإكمال الملف: {missingProfileTasks.join('، ')}.
+              </p>
+              <div className="student-profile-completion-items">
+                {profileChecklist.map((task) => (
+                  <span className={task.complete ? 'is-complete' : ''} key={task.label}>
+                    <span aria-hidden="true">{task.complete ? '✓' : '○'}</span>
+                    {task.label} {task.weight}%
+                  </span>
+                ))}
+                </div>
+                </section>
+                {profileCompletion === 100 && (
+                  <div className="student-profile-completion-success" role="status" aria-live="polite">
+                    <span className="student-profile-completion-success-icon" aria-hidden="true">✓</span>
+                    <span>
+                      <strong>عمل ممتاز!</strong>
+                      <small>اكتمل ملفك الشخصي بالكامل.</small>
+                    </span>
+                  </div>
+                )}
+              </div>
+          )}
+
           <div className="barcode-section student-qr-section">
             <div className="barcode-box qr-box student-qr-card">
               <img
                 className="barcode-svg qr-image"
-                src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
-                  `UDTI|${formatStudentValue(loggedStudent?.['اسم الطالب'])}|${formatStudentValue(loggedStudent?.['الرقم الجامعي'])}`
-                )}`}
+                src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(studentQrData)}`}
                 alt="QR code للطالب"
               />
-              <div className="barcode-name">{formatStudentValue(loggedStudent?.['اسم الطالب'])}</div>
               <div className="barcode-id">{formatStudentValue(loggedStudent?.['الرقم الجامعي'])}</div>
+              <button
+                className="student-qr-export-trigger"
+                type="button"
+                onClick={() => { setQrExportError(''); void downloadStudentQrPdf(); }}
+                disabled={isExportingQr}
+              >
+                <Download size={16} aria-hidden="true" />
+                <span>{isExportingQr ? 'جارٍ تجهيز PDF...' : 'تنزيل الباركود PDF'}</span>
+              </button>
+              {qrExportError && <p className="student-qr-export-error" role="alert">{qrExportError}</p>}
             </div>
           </div>
 
-          <div className="system-notice">{notice}</div>
+          {notice ? (
+            <div className="system-notice">{notice}</div>
+          ) : (
+            <div className="system-notice student-developer-credit">
+              <Code2 size={17} aria-hidden="true" />
+              <span>
+                Developed by{' '}
+                <a href="https://www.facebook.com/salem.y.homisha" target="_blank" rel="noreferrer">
+                  Dr. Salem
+                </a>
+              </span>
+            </div>
+          )}
 
           <div className="header student-dashboard-title">
             <h1>الحساب الجامعي</h1>
+            <button
+              type="button"
+              onClick={() => setSoundEnabled((s) => !s)}
+              title={soundEnabled ? 'إيقاف صوت النقر' : 'تفعيل صوت النقر'}
+              aria-label={soundEnabled ? 'إيقاف صوت النقر' : 'تفعيل صوت النقر'}
+              style={{
+                marginInlineStart: 12,
+                background: 'transparent',
+                border: '1px solid #cbd5e1',
+                borderRadius: 8,
+                padding: '6px 10px',
+                cursor: 'pointer',
+                fontSize: 16,
+              }}
+            >
+              {soundEnabled ? '🔊' : '🔇'}
+            </button>
           </div>
 
           <div className="student-info student-profile-grid">
-            <div className="info-item"><span className="info-label"><i className="fa-solid fa-user" /> الاسم</span> {formatStudentValue(loggedStudent?.['اسم الطالب'])}</div>
             <div className="info-item"><span className="info-label"><i className="fa-solid fa-id-card" /> الرقم الجامعي</span> {formatStudentValue(loggedStudent?.['الرقم الجامعي'])}</div>
             <div className="info-item"><span className="info-label"><i className="fa-solid fa-building-columns" /> القسم</span> {formatStudentValue(loggedStudent?.['القسم'])}</div>
             <div className="info-item"><span className="info-label"><i className="fa-solid fa-graduation-cap" /> اسم الأب</span> {formatStudentValue(loggedStudent?.['اسم الاب'])}</div>
@@ -1355,6 +2205,102 @@ export default function Home() {
               </div>
             )}
 
+            {activeTab === 'skills' && (
+              <div className="tab-content active student-skills-panel">
+                <div className="student-skills-heading">
+                  <div>
+                    <h2>مهاراتي</h2>
+                    <p>اختر حتى ثلاث مهارات، ويمكنك تعديلها لاحقاً.</p>
+                  </div>
+                  {!isEditingSkills && studentSkills.length > 0 && (
+                    <button
+                      type="button"
+                      className="student-skills-edit"
+                      onClick={() => {
+                        setSkillDrafts(studentSkills.map((skill) => ({ ...skill })));
+                        setIsEditingSkills(true);
+                      }}
+                    >
+                      تعديل المهارات
+                    </button>
+                  )}
+                </div>
+
+                {skillsMessage && <p className="student-skills-message" role="status">{skillsMessage}</p>}
+
+                {!isEditingSkills && studentSkills.length > 0 ? (
+                  <div className="student-skills-list">
+                    {studentSkills.map((skill) => (
+                      <article className="student-skill-item" key={skill.category}>
+                        <strong>{skill.category}</strong>
+                        {skill.detail && <span>{skill.detail}</span>}
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="student-skills-editor">
+                    <div className="student-skills-options" aria-label="خيارات المهارات">
+                      {skillCategories.map((category) => {
+                        const selected = skillDrafts.some((skill) => skill.category === category);
+                        return (
+                          <button
+                            type="button"
+                            key={category}
+                            className={`student-skill-option${selected ? ' selected' : ''}`}
+                            aria-pressed={selected}
+                            onClick={() => toggleSkillCategory(category)}
+                          >
+                            <span className="student-skill-check" aria-hidden="true">{selected ? '✓' : '+'}</span>
+                            {category}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="student-skills-count">المحدد: {skillDrafts.length} من 3</div>
+
+                    {skillDrafts.filter((skill) => ['رياضة', 'أخرى'].includes(skill.category)).map((skill) => (
+                      <label className="student-skill-detail" key={skill.category}>
+                        <span>{skill.category === 'رياضة' ? 'نوع الرياضة' : 'اكتب مهارتك'}</span>
+                        {skill.category === 'رياضة' && (
+                          <select
+                            value={sportTypes.includes(skill.detail) ? skill.detail : ''}
+                            onChange={(event) => updateSkillDetail(skill.category, event.target.value)}
+                          >
+                            <option value="">اختر نوع الرياضة</option>
+                            {sportTypes.filter((sport) => sport !== 'رياضة أخرى').map((sport) => <option key={sport} value={sport}>{sport}</option>)}
+                          </select>
+                        )}
+                        <input
+                          type="text"
+                          value={skill.category === 'رياضة' && sportTypes.includes(skill.detail) ? '' : skill.detail}
+                          onChange={(event) => updateSkillDetail(skill.category, event.target.value)}
+                          placeholder={skill.category === 'رياضة' ? 'أو اكتب نوع رياضة آخر' : 'مثال: العزف على العود'}
+                          maxLength={80}
+                          required={skill.category === 'أخرى'}
+                        />
+                      </label>
+                    ))}
+
+                    <div className="student-skills-actions">
+                      {studentSkills.length > 0 && (
+                        <button type="button" className="student-skills-cancel" onClick={() => setIsEditingSkills(false)}>
+                          إلغاء
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="student-skills-save"
+                        onClick={() => void saveStudentSkills()}
+                        disabled={isSavingSkills || skillDrafts.length === 0}
+                      >
+                        {isSavingSkills ? 'جارٍ الحفظ...' : 'حفظ المهارات'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
           </div>
 
           <div className="last-updated">آخر تحديث للنظام: {formatDate(loggedStudent?.['تاريخ_تغيير_الفئة'])}</div>
@@ -1363,6 +2309,97 @@ export default function Home() {
             <button className="logout-button" type="button" onClick={logout}>تسجيل الخروج</button>
           </div>
         </div>
+
+        {teacherEvaluationGateOpen && (
+          <div className="teacher-evaluation-gate-backdrop">
+            <section className="teacher-evaluation-gate" role="dialog" aria-modal="true" aria-labelledby="teacher-evaluation-gate-title">
+              <header className="teacher-evaluation-gate-header">
+                <span className="teacher-evaluation-kicker">إجراء مطلوب قبل متابعة حسابك</span>
+                <h2 id="teacher-evaluation-gate-title">تقييم المدرسين</h2>
+                <p>يرجى تقييم كل مدرس في المقررات التي شرحها. لن تتمكن من استخدام صفحة الطالب قبل حفظ جميع التقييمات.</p>
+                {teacherEvaluationReady && !teacherEvaluationError && teacherEvaluationTasks.length > 0 && (
+                  <div className="teacher-evaluation-progress" role="status">
+                    اكتمل {teacherEvaluationTasks.length - pendingTeacherEvaluationCount} من {teacherEvaluationTasks.length} مقررات
+                  </div>
+                )}
+              </header>
+
+              <div className="teacher-evaluation-gate-content">
+                {!teacherEvaluationReady || teacherEvaluationLoading ? (
+                  <div className="teacher-evaluation-gate-status" role="status">جارٍ تحميل المدرسين ومقرراتهم...</div>
+                ) : teacherEvaluationError ? (
+                  <div className="teacher-evaluation-gate-error" role="alert">
+                    <p>{teacherEvaluationError}</p>
+                    <button type="button" className="logout-button" onClick={logout}>تسجيل الخروج</button>
+                  </div>
+                ) : (
+                  <div className="teacher-evaluation-gate-list">
+                    {teachers.map((teacher) => (
+                      <article className="teacher-evaluation-gate-teacher" key={teacher.id}>
+                        <h3>{teacher.name}</h3>
+                        {teacher.subjects.map((subject) => {
+                          const key = getTeacherRatingKey(teacher.id, subject);
+                          const selectedRating = teacherRatingDrafts[key];
+                          const savedRating = savedTeacherRatings[key];
+                          const currentNote = teacherRatingNotes[key] ?? '';
+                          const savedNote = savedTeacherNotes[key] ?? '';
+                          const isSaving = savingTeacherRatingKey === key;
+                          const unchanged = savedRating === selectedRating && savedNote === currentNote;
+
+                          return (
+                            <div className="teacher-evaluation-gate-subject" key={key}>
+                              <div className="teacher-evaluation-gate-subject-title">
+                                <strong>{subject}</strong>
+                                {savedRating !== undefined && <span>تم الحفظ</span>}
+                              </div>
+                              <div className="teacher-rating-options" role="group" aria-label={`تقييم ${teacher.name} في ${subject}`}>
+                                {teacherRatingOptions.map((option) => (
+                                  <button
+                                    type="button"
+                                    key={option.value}
+                                    className={selectedRating === option.value ? 'is-selected' : ''}
+                                    aria-pressed={selectedRating === option.value}
+                                    onClick={() => setTeacherRatingDrafts((current) => ({ ...current, [key]: option.value }))}
+                                  >
+                                    {option.label}
+                                  </button>
+                                ))}
+                              </div>
+                              <label className="teacher-evaluation-note">
+                                <span>ملاحظة (اختياري)</span>
+                                <textarea
+                                  value={currentNote}
+                                  maxLength={1000}
+                                  rows={2}
+                                  onChange={(event) => setTeacherRatingNotes((current) => ({ ...current, [key]: event.target.value }))}
+                                  placeholder="اكتب ملاحظتك عن شرح المقرر"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="teacher-rating-save"
+                                disabled={selectedRating === undefined || isSaving || unchanged}
+                                onClick={() => void saveTeacherRating(teacher, subject)}
+                              >
+                                {isSaving ? 'جارٍ الحفظ...' : savedRating !== undefined ? 'تحديث التقييم' : 'حفظ التقييم'}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </article>
+                    ))}
+                  </div>
+                )}
+                {teacherRatingNotice && <p className="teacher-evaluation-gate-notice" role="status">{teacherRatingNotice}</p>}
+              </div>
+
+              <footer className="teacher-evaluation-confidentiality">
+                <strong>تقييماتك سرية للغاية، لا داعي للقلق.</strong>
+                <span>لن تظهر للطلاب الآخرين، ويمكن للمشرفين المخوّلين الاطلاع عليها لتحسين العملية التعليمية.</span>
+              </footer>
+            </section>
+          </div>
+        )}
       </div>
     </main>
   );

@@ -7,6 +7,71 @@ const THEME_STORAGE_KEY = 'udti-theme';
 export function ThemeToggle() {
   const [isDark, setIsDark] = useState(false);
   const switchRef = useRef<HTMLLabelElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const soundSourcesRef = useRef<OscillatorNode[]>([]);
+
+  const stopThemeSound = () => {
+    soundSourcesRef.current.forEach((source) => {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // The source may already have finished.
+      }
+    });
+    soundSourcesRef.current = [];
+  };
+
+  const playThemeSound = (dark: boolean) => {
+    stopThemeSound();
+
+    const AudioContextConstructor = window.AudioContext;
+    if (!AudioContextConstructor) return;
+
+    const audioContext = audioContextRef.current ?? new AudioContextConstructor();
+    audioContextRef.current = audioContext;
+    void audioContext.resume();
+
+    const playChirps = () => {
+      const notes = dark
+        ? [
+            { offset: 0, duration: 0.08, startHz: 4200, endHz: 4550 },
+            { offset: 0.12, duration: 0.07, startHz: 4400, endHz: 4750 },
+            { offset: 0.31, duration: 0.09, startHz: 4100, endHz: 4500 },
+          ]
+        : [
+            { offset: 0, duration: 0.15, startHz: 2100, endHz: 3050 },
+            { offset: 0.2, duration: 0.11, startHz: 2850, endHz: 2250 },
+            { offset: 0.43, duration: 0.16, startHz: 2450, endHz: 3350 },
+            { offset: 0.68, duration: 0.2, startHz: 3150, endHz: 2150 },
+          ];
+
+      notes.forEach(({ offset, duration, startHz, endHz }) => {
+        const oscillator = audioContext.createOscillator();
+        const volume = audioContext.createGain();
+        const startAt = audioContext.currentTime + offset;
+
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(startHz, startAt);
+        oscillator.frequency.exponentialRampToValueAtTime(endHz, startAt + duration);
+        volume.gain.setValueAtTime(0.0001, startAt);
+        volume.gain.linearRampToValueAtTime(dark ? 0.012 : 0.025, startAt + 0.02);
+        volume.gain.linearRampToValueAtTime(0.0001, startAt + duration);
+        oscillator.connect(volume);
+        volume.connect(audioContext.destination);
+        oscillator.onended = () => {
+          soundSourcesRef.current = soundSourcesRef.current.filter((source) => source !== oscillator);
+          oscillator.disconnect();
+          volume.disconnect();
+        };
+        soundSourcesRef.current.push(oscillator);
+        oscillator.start(startAt);
+        oscillator.stop(startAt + duration + 0.01);
+      });
+    };
+
+    playChirps();
+  };
 
   const toggleTheme = () => {
     const toggleBounds = switchRef.current?.getBoundingClientRect();
@@ -17,6 +82,7 @@ export function ThemeToggle() {
     document.documentElement.classList.remove('theme-to-dark', 'theme-to-light');
     document.documentElement.classList.add(isDark ? 'theme-to-light' : 'theme-to-dark');
     document.documentElement.classList.add('theme-transitioning');
+    playThemeSound(!isDark);
     setIsDark((prev) => !prev);
     window.setTimeout(() => {
       document.documentElement.classList.remove('theme-transitioning', 'theme-to-dark', 'theme-to-light');
@@ -36,6 +102,22 @@ export function ThemeToggle() {
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
     localStorage.setItem(THEME_STORAGE_KEY, isDark ? 'dark' : 'light');
   }, [isDark]);
+
+  useEffect(() => {
+    return () => {
+      soundSourcesRef.current.forEach((source) => {
+        source.onended = null;
+        try {
+          source.stop();
+        } catch {
+          // The source may already have finished.
+        }
+      });
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        void audioContextRef.current.close();
+      }
+    };
+  }, []);
 
   return (
     <div className="theme-toggle-wrap">

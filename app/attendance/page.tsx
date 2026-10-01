@@ -2,9 +2,12 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { BrowserMultiFormatReader } from '@zxing/browser';
+import { CheckCircle2, ScanLine, UserRound } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { writeAuditLog } from '../../lib/auditLog';
 import { getClassAvailabilityOptions } from '../../lib/studentData';
+import { teacherEvaluationsTemporarilyDisabled } from '../../lib/featureFlags';
 import { buildStudentTelegramMessage, sendTelegramNotification } from '../../lib/telegram';
 
 type StudentRow = {
@@ -25,6 +28,7 @@ type StudentRow = {
   'السنه الدراسية'?: string | number;
   'telegram_chat_id'?: string | number | null;
   'telegram_notifications_enabled'?: boolean | string;
+  avatar_url?: string | null;
   class?: string;
   year?: string;
   password?: string;
@@ -106,7 +110,6 @@ const allowedStudentYears = ['أولى', 'ثانية'];
 const defaultStudentSection = 'تعويضات أسنان';
 const pendingAttendanceStorageKey = 'udti-pending-attendance-jobs';
 const studentCacheStorageKey = 'udti-attendance-student-cache';
-const localSessionLockKey = 'udti-active-attendance-session';
 const recentSessionWindowMs = 60 * 60 * 1000;
 const supervisorSessionStorageKey = 'udti-supervisor-session';
 const rememberedSupervisorUsernameKey = 'udti-remembered-supervisor-username';
@@ -463,6 +466,13 @@ const getSupabaseErrorText = (error: unknown) => {
   }
 };
 
+const getTeacherEvaluationErrorText = (error: unknown) => {
+  const message = getSupabaseErrorText(error);
+  return message.includes('teacher-evaluation-server-key-missing')
+    ? 'أضف SUPABASE_SERVICE_ROLE_KEY إلى بيئة الخادم لتأمين التقييمات.'
+    : message;
+};
+
 const isDuplicateStudentIdError = (error: unknown) => {
   if (!error || typeof error !== 'object') return false;
 
@@ -606,26 +616,6 @@ const writeCachedStudents = (classValue: string, year: string, students: Student
 
 const getSessionKey = (course: string, classValue: string) => `${course.trim()}::${classValue.trim()}`;
 
-const readLocalSessionLock = () => {
-  if (typeof window === 'undefined') return null;
-
-  try {
-    const stored = window.localStorage.getItem(localSessionLockKey);
-    return stored ? JSON.parse(stored) as RecentAttendanceSession : null;
-  } catch {
-    return null;
-  }
-};
-
-const writeLocalSessionLock = (session: RecentAttendanceSession) => {
-  if (typeof window !== 'undefined') window.localStorage.setItem(localSessionLockKey, JSON.stringify(session));
-};
-
-const clearLocalSessionLock = (sessionId: string) => {
-  const current = readLocalSessionLock();
-  if (current?.id === sessionId && typeof window !== 'undefined') window.localStorage.removeItem(localSessionLockKey);
-};
-
 const normalizeSessionRow = (row: Record<string, unknown>): RecentAttendanceSession | null => {
   const id = String(row['session_id'] ?? row['معرف الجلسة'] ?? row['id'] ?? '').trim();
   const course = String(row['المادة'] ?? row['course'] ?? '').trim();
@@ -683,7 +673,7 @@ const createAttendanceSession = async (course: string, classValue: string, super
 
   const { error } = await supabase.from(tableCandidates.sessions[0]).insert([{
     session_id: session.id,
-    session_key: getSessionKey(session.course, session.classValue),
+    session_key: `${getSessionKey(session.course, session.classValue)}::${session.id}`,
     المادة: session.course,
     الفئة: session.classValue,
     المشرف: session.supervisor,
@@ -692,7 +682,6 @@ const createAttendanceSession = async (course: string, classValue: string, super
   }]);
 
   if (error && !isMissingSessionTableError(error)) return { session: null, error };
-  writeLocalSessionLock(session);
   return { session, error: null };
 };
 
@@ -702,7 +691,6 @@ const closeAttendanceSession = async (sessionId: string) => {
     .update({ الحالة: 'منتهية', ended_at: new Date().toISOString() })
     .eq('session_id', sessionId);
 
-  clearLocalSessionLock(sessionId);
   return !error || isMissingSessionTableError(error);
 };
 
@@ -958,6 +946,17 @@ export default function AttendancePage() {
   const [students, setStudents] = useState<StudentRow[]>([]);
   const [attendanceData, setAttendanceData] = useState<Record<string, AttendanceEntry>>({});
   const [loading, setLoading] = useState(false);
+  const [isSendingTelegramToAll, setIsSendingTelegramToAll] = useState(false);
+  const [showQrScanner, setShowQrScanner] = useState(false);
+  const [qrScannerLoading, setQrScannerLoading] = useState(false);
+  const [qrScannerError, setQrScannerError] = useState('');
+  const [qrScanSuccess, setQrScanSuccess] = useState(false);
+  const [scannedStudentName, setScannedStudentName] = useState('');
+  const qrVideoRef = useRef<HTMLVideoElement | null>(null);
+  const qrScannerControlsRef = useRef<{ stop: () => void } | null>(null);
+  const qrScanHandlerRef = useRef<(rawValue: string) => void>(() => undefined);
+  const scannedQrStudentIdsRef = useRef<Set<string>>(new Set());
+  const qrScanSuccessTimerRef = useRef<number | null>(null);
   const [supervisorLoggedIn, setSupervisorLoggedIn] = useState(false);
   const [supervisorUsername, setSupervisorUsername] = useState<string>('');
   const [supervisorPassword, setSupervisorPassword] = useState('');
@@ -978,6 +977,15 @@ export default function AttendancePage() {
   const [supervisorForm, setSupervisorForm] = useState({ username: '', password: '', degree: '3' });
   const [supervisorProfileForm, setSupervisorProfileForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [supervisorProfileLoading, setSupervisorProfileLoading] = useState(false);
+  const [teacherEvaluationEnabled, setTeacherEvaluationEnabled] = useState(false);
+  const [teacherEvaluationSettingsLoading, setTeacherEvaluationSettingsLoading] = useState(false);
+  const [teacherEvaluationSettingsSaving, setTeacherEvaluationSettingsSaving] = useState(false);
+  const [teacherEvaluationSettingsNotice, setTeacherEvaluationSettingsNotice] = useState('');
+  const [showTeacherEvaluationReport, setShowTeacherEvaluationReport] = useState(false);
+  const [teacherEvaluationReportLoading, setTeacherEvaluationReportLoading] = useState(false);
+  const [teacherEvaluationReportTeachers, setTeacherEvaluationReportTeachers] = useState<AdminRecord[]>([]);
+  const [teacherEvaluationReportRows, setTeacherEvaluationReportRows] = useState<AdminRecord[]>([]);
+  const [teacherEvaluationReportError, setTeacherEvaluationReportError] = useState('');
   const [editingSupervisorId, setEditingSupervisorId] = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminSearch, setAdminSearch] = useState('');
@@ -1140,6 +1148,77 @@ export default function AttendancePage() {
       setNotice(`تعذر تحميل بيانات الطلاب: ${getSupabaseErrorText(error)}`);
     } finally {
       setAdminLoading(false);
+    }
+  };
+
+  const refreshTeacherEvaluationSetting = async () => {
+    if (teacherEvaluationsTemporarilyDisabled) {
+      setTeacherEvaluationEnabled(false);
+      setTeacherEvaluationSettingsNotice('تقييم المدرسين متوقف مؤقتًا.');
+      return;
+    }
+    setTeacherEvaluationSettingsLoading(true);
+    setTeacherEvaluationSettingsNotice('');
+    try {
+      const response = await fetch('/api/supervisor/teacher-evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'settings', username: supervisorUsername, password: supervisorPassword }),
+      });
+      const result = await response.json() as { success?: boolean; enabled?: boolean; error?: string };
+      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-settings-failed');
+      setTeacherEvaluationEnabled(result.enabled === true);
+    } catch (error) {
+      setTeacherEvaluationSettingsNotice(`تعذر تحميل الإعداد: ${getTeacherEvaluationErrorText(error)}`);
+    } finally {
+      setTeacherEvaluationSettingsLoading(false);
+    }
+  };
+
+  const toggleTeacherEvaluation = async () => {
+    if (teacherEvaluationsTemporarilyDisabled) {
+      setTeacherEvaluationSettingsNotice('تقييم المدرسين متوقف مؤقتًا.');
+      return;
+    }
+    const nextValue = !teacherEvaluationEnabled;
+    setTeacherEvaluationSettingsSaving(true);
+    setTeacherEvaluationSettingsNotice('');
+    try {
+      const response = await fetch('/api/supervisor/teacher-evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set-enabled', username: supervisorUsername, password: supervisorPassword, enabled: nextValue }),
+      });
+      const result = await response.json() as { success?: boolean; enabled?: boolean; error?: string };
+      if (!response.ok || !result.success || result.enabled !== nextValue) {
+        throw new Error(result.error || 'لم يتم تثبيت حالة التفعيل في قاعدة البيانات.');
+      }
+      setTeacherEvaluationEnabled(nextValue);
+      setTeacherEvaluationSettingsNotice(nextValue ? 'تم تفعيل تقييم المدرسين للطلاب.' : 'تم إيقاف تقييم المدرسين.');
+    } catch (error) {
+      setTeacherEvaluationSettingsNotice(`تعذر حفظ الإعداد: ${getTeacherEvaluationErrorText(error)}`);
+    } finally {
+      setTeacherEvaluationSettingsSaving(false);
+    }
+  };
+
+  const refreshTeacherEvaluationReport = async () => {
+    setTeacherEvaluationReportLoading(true);
+    setTeacherEvaluationReportError('');
+    try {
+      const response = await fetch('/api/supervisor/teacher-evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'report', username: supervisorUsername, password: supervisorPassword }),
+      });
+      const result = await response.json() as { success?: boolean; teachers?: AdminRecord[]; evaluations?: AdminRecord[]; error?: string };
+      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-report-failed');
+      setTeacherEvaluationReportTeachers(result.teachers ?? []);
+      setTeacherEvaluationReportRows(result.evaluations ?? []);
+    } catch (error) {
+      setTeacherEvaluationReportError(`تعذر تحميل التقييمات: ${getTeacherEvaluationErrorText(error)}`);
+    } finally {
+      setTeacherEvaluationReportLoading(false);
     }
   };
 
@@ -1736,6 +1815,12 @@ export default function AttendancePage() {
     }
   }, [supervisorLoggedIn, selectedFeature]);
 
+  useEffect(() => {
+    if (supervisorLoggedIn && selectedFeature === 'supervisors') {
+      void refreshTeacherEvaluationSetting();
+    }
+  }, [supervisorLoggedIn, selectedFeature]);
+
   const handleSupervisorLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -1823,22 +1908,7 @@ export default function AttendancePage() {
     setLoading(true);
     let openedSessionId: string | null = null;
     try {
-      const sessionKey = getSessionKey(selectedCourse, selectedClass);
-      const localLock = readLocalSessionLock();
-      if (localLock && getSessionKey(localLock.course, localLock.classValue) === sessionKey
-        && Date.parse(localLock.startedAt) >= Date.now() - recentSessionWindowMs) {
-        setNotice(`هذه الجلسة مفتوحة حالياً للمادة ${localLock.course} والفئة ${localLock.classValue} بواسطة ${localLock.supervisor}.`);
-        return;
-      }
-
       const currentSessions = await loadRecentAttendanceSessions();
-      const duplicateSession = currentSessions.find((session) => getSessionKey(session.course, session.classValue) === sessionKey);
-      if (duplicateSession) {
-        setRecentSessions(currentSessions);
-        setNotice(`لا يمكن فتح جلسة جديدة. توجد جلسة مفتوحة لنفس المادة والفئة بواسطة ${duplicateSession.supervisor}.`);
-        return;
-      }
-
       const created = await createAttendanceSession(selectedCourse, selectedClass, supervisorUsername);
       if (created.error || !created.session) {
         const message = getSupabaseErrorText(created.error);
@@ -1937,6 +2007,78 @@ export default function AttendancePage() {
     });
   };
 
+  const handleScannedStudentQr = (rawValue: string) => {
+    const qrParts = rawValue.trim().split('|');
+    const studentId = qrParts[0]?.toUpperCase() === 'UDTI' ? String(qrParts[2] ?? '').trim() : rawValue.trim();
+    if (!studentId) {
+      setNotice('رمز QR لا يحتوي على رقم جامعي صالح.');
+      return;
+    }
+
+    const student = students.find((candidate) => getStudentIdentifier(candidate) === studentId);
+    if (!student) {
+      setNotice(`لم يتم العثور على الطالب صاحب الرقم ${studentId} ضمن طلاب هذه الجلسة.`);
+      return;
+    }
+
+    if (scannedQrStudentIdsRef.current.has(studentId)) return;
+    scannedQrStudentIdsRef.current.add(studentId);
+
+    if (attendanceData[studentId]?.status === 'present') {
+      setNotice(`الطالب ${getFullStudentName(student)} مسجل حاضر مسبقًا.`);
+      return;
+    }
+
+    void updateStudentStatus(student, 'present');
+    setScannedStudentName(getFullStudentName(student));
+    setQrScanSuccess(true);
+    if (qrScanSuccessTimerRef.current !== null) window.clearTimeout(qrScanSuccessTimerRef.current);
+    qrScanSuccessTimerRef.current = window.setTimeout(() => {
+      setQrScanSuccess(false);
+      setScannedStudentName('');
+      qrScanSuccessTimerRef.current = null;
+    }, 2000);
+  };
+  qrScanHandlerRef.current = handleScannedStudentQr;
+
+  useEffect(() => {
+    if (!showQrScanner || !sessionActive) return;
+
+    let cancelled = false;
+    const videoElement = qrVideoRef.current;
+    if (!videoElement) return;
+
+    const reader = new BrowserMultiFormatReader();
+    setQrScannerLoading(true);
+    setQrScannerError('');
+
+    void reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' } } }, videoElement, (result) => {
+      if (!result || cancelled) return;
+      qrScanHandlerRef.current(result.getText());
+    }).then((controls) => {
+      if (cancelled) {
+        controls.stop();
+        return;
+      }
+      qrScannerControlsRef.current = controls;
+      setQrScannerLoading(false);
+    }).catch(() => {
+      if (cancelled) return;
+      setQrScannerLoading(false);
+      setQrScannerError('تعذر تشغيل الكاميرا. اسمح للمتصفح باستخدام الكاميرا ثم أعد المحاولة.');
+    });
+
+    return () => {
+      cancelled = true;
+      qrScannerControlsRef.current?.stop();
+      qrScannerControlsRef.current = null;
+    };
+  }, [showQrScanner, sessionActive]);
+
+  useEffect(() => () => {
+    if (qrScanSuccessTimerRef.current !== null) window.clearTimeout(qrScanSuccessTimerRef.current);
+  }, []);
+
   const handleSendTelegramForStudent = async (student: StudentRow, messageText = 'تذكير بالحضور') => {
     const studentName = getFullStudentName(student);
     const studentYear = normalizeText(student['السنه الدراسية']);
@@ -1974,6 +2116,51 @@ export default function AttendancePage() {
     } catch (error) {
       console.error('Telegram student notify failed:', error);
       setNotice(`تعذر إرسال تنبيه الطالب ${studentName} إلى التليجرام.`);
+    }
+  };
+
+  const handleSendTelegramToAll = async () => {
+    const recipients = students.filter((student) => {
+      const enabled = student.telegram_notifications_enabled ?? student['telegram_notifications_enabled'] ?? false;
+      const notificationEnabled = typeof enabled === 'string'
+        ? ['true', '1', 'yes'].includes(enabled.trim().toLowerCase())
+        : Boolean(enabled);
+      const chatId = String(student.telegram_chat_id ?? student['telegram_chat_id'] ?? '').trim();
+      return notificationEnabled && Boolean(chatId);
+    });
+
+    if (!recipients.length) {
+      setNotice('لا يوجد طلاب في الجلسة فعّلوا تنبيهات تلجرام وربطوا حساباتهم.');
+      return;
+    }
+
+    setIsSendingTelegramToAll(true);
+    let sent = 0;
+    let failed = 0;
+    const statusText = `تنبيه حضور: جلسة مادة ${selectedCourse} للفئة ${selectedClass} قائمة الآن. يرجى التوجه إلى القاعة.`;
+
+    try {
+      for (const student of recipients) {
+        const chatId = String(student.telegram_chat_id ?? student['telegram_chat_id'] ?? '').trim();
+        const message = buildStudentTelegramMessage({
+          studentName: getFullStudentName(student),
+          studentId: getStudentIdentifier(student) || 'غير محدد',
+          studentYear: String(student['السنه الدراسية'] ?? 'غير محددة'),
+          studentClass: String(student['الفئة'] ?? 'غير محددة'),
+          statusText,
+          title: 'تنبيه الحضور',
+        });
+        try {
+          const result = await sendTelegramNotification(message, { chatId, enabled: true });
+          if (result && result.ok !== false) sent += 1;
+          else failed += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      setNotice(`اكتمل إرسال تنبيه تلجرام: تم إرساله إلى ${sent} طالب${failed ? `، وتعذر إرساله إلى ${failed}` : ''}.`);
+    } finally {
+      setIsSendingTelegramToAll(false);
     }
   };
 
@@ -2772,7 +2959,16 @@ export default function AttendancePage() {
                 return (
                   <article className="student-management-card" key={`${id || name}-${className}`}>
                     <div className="student-management-card-header">
-                      <strong>{name}</strong>
+                      <div className="student-management-identity">
+                        {student.avatar_url ? (
+                          <img className="student-management-avatar" src={student.avatar_url} alt={`صورة ${name}`} loading="lazy" />
+                        ) : (
+                          <span className="student-management-avatar-placeholder" aria-label="لا توجد صورة شخصية">
+                            <UserRound size={32} aria-hidden="true" />
+                          </span>
+                        )}
+                        <strong>{name}</strong>
+                      </div>
                       <span className="student-management-badge">{className}</span>
                     </div>
                     <div className="student-management-card-body">
@@ -2833,6 +3029,97 @@ export default function AttendancePage() {
         {supervisorLoggedIn && selectedFeature === 'supervisors' && (
           <section className="admin-dashboard-panel">
             <div className="admin-dashboard-heading"><div><span className="feature-panel-kicker">إدارة الحسابات</span><h1>إدارة المشرفين</h1><p>يمكن للدرجة الأولى إنشاء الحسابات وتغيير الدرجات وكلمات المرور.</p></div><button type="button" className="action-button primary" onClick={() => void refreshAdminData()}>تحديث</button></div>
+            <div className="teacher-evaluation-admin-setting">
+              <div>
+                <strong>تقييم المدرسين</strong>
+                <p>{teacherEvaluationsTemporarilyDisabled ? 'الميزة متوقفة مؤقتًا حتى استقرار التقييمات.' : 'عند التفعيل، تظهر قائمة المدرسين ومقرراتهم في حساب الطالب ليقيّم الشرح.'}</p>
+              </div>
+              <button
+                type="button"
+                className={`action-button teacher-evaluation-toggle${teacherEvaluationEnabled ? ' is-enabled' : ''}`}
+                aria-pressed={teacherEvaluationEnabled}
+                onClick={() => void toggleTeacherEvaluation()}
+                disabled={teacherEvaluationsTemporarilyDisabled || teacherEvaluationSettingsLoading || teacherEvaluationSettingsSaving}
+              >
+                {teacherEvaluationsTemporarilyDisabled ? 'متوقفة مؤقتًا' : teacherEvaluationSettingsLoading ? 'جارٍ تحميل الإعداد...' : teacherEvaluationSettingsSaving ? 'جارٍ الحفظ...' : teacherEvaluationEnabled ? 'إيقاف الميزة' : 'تفعيل الميزة'}
+              </button>
+              <button
+                type="button"
+                className="action-button"
+                disabled={teacherEvaluationsTemporarilyDisabled}
+                onClick={() => {
+                  const nextVisibility = !showTeacherEvaluationReport;
+                  setShowTeacherEvaluationReport(nextVisibility);
+                  if (nextVisibility) void refreshTeacherEvaluationReport();
+                }}
+              >
+                {teacherEvaluationsTemporarilyDisabled ? 'التقييمات موقوفة' : showTeacherEvaluationReport ? 'إخفاء التقييمات' : 'عرض التقييمات'}
+              </button>
+              {teacherEvaluationSettingsNotice && <span className="teacher-evaluation-admin-notice" role="status">{teacherEvaluationSettingsNotice}</span>}
+            </div>
+            {showTeacherEvaluationReport && !teacherEvaluationsTemporarilyDisabled && (
+              <section className="teacher-evaluation-report" aria-label="تقييمات المدرسين">
+                <div className="teacher-evaluation-report-heading">
+                  <h2>تقييمات المدرسين والمواد</h2>
+                  <button type="button" className="action-button" onClick={() => void refreshTeacherEvaluationReport()} disabled={teacherEvaluationReportLoading}>
+                    {teacherEvaluationReportLoading ? 'جارٍ التحديث...' : 'تحديث النتائج'}
+                  </button>
+                </div>
+                {teacherEvaluationReportError && <p className="teacher-evaluation-report-error" role="alert">{teacherEvaluationReportError}</p>}
+                {teacherEvaluationReportLoading ? (
+                  <div className="loading-box">جارٍ تحميل التقييمات...</div>
+                ) : teacherEvaluationReportTeachers.length === 0 ? (
+                  <div className="loading-box">لا يوجد مدرسون في الجدول.</div>
+                ) : (
+                  <div className="teacher-evaluation-report-list">
+                    {teacherEvaluationReportTeachers.map((teacher) => {
+                      const teacherId = String(teacher.id ?? '');
+                      const teacherRows = teacherEvaluationReportRows.filter((row) => String(row.teacher_id ?? '') === teacherId);
+                      const scoredRows = teacherRows.map((row) => Number(row.rating)).filter((rating) => rating > 0);
+                      const average = scoredRows.length
+                        ? (scoredRows.reduce((total, rating) => total + rating, 0) / scoredRows.length).toFixed(1)
+                        : '—';
+                      const subjects = Array.isArray(teacher.subjects) ? teacher.subjects.map(String).join('، ') : 'لا توجد مقررات';
+
+                      return (
+                        <article className="teacher-evaluation-report-card" key={teacherId}>
+                          <header>
+                            <div>
+                              <h3>{String(teacher.teacher_name ?? 'مدرس')}</h3>
+                              <p>المقررات: {subjects}</p>
+                            </div>
+                            <div className="teacher-evaluation-report-summary">
+                              <span>عدد التقييمات: {teacherRows.length}</span>
+                              <span>المعدل (باستثناء لا أعلم): {average}</span>
+                            </div>
+                          </header>
+                          {teacherRows.length === 0 ? (
+                            <p className="teacher-evaluation-report-empty">لم يقيّم الطلاب هذا المدرس بعد.</p>
+                          ) : (
+                            <div className="teacher-evaluation-report-entries">
+                              {teacherRows.map((row) => {
+                                const rating = Number(row.rating);
+                                const ratingLabel = ['لا أعلم', 'سيئ', 'مقبول', 'جيد', 'رائع'][rating] ?? 'غير معروف';
+                                return (
+                                  <div className="teacher-evaluation-report-entry" key={String(row.id)}>
+                                    <strong>{String(row.student_name ?? 'اسم غير مسجل')}</strong>
+                                    <span>الرقم الجامعي: {String(row.student_id ?? 'غير متوفر')}</span>
+                                    <span>المقرر: {String(row.subject ?? 'غير محدد')}</span>
+                                    <span>التقييم: {ratingLabel}</span>
+                                    <p>الملاحظة: {String(row.note ?? '').trim() || 'لا توجد ملاحظة'}</p>
+                                    <time>{String(row.updated_at ?? '')}</time>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
             <form className="admin-supervisor-form" onSubmit={handleSupervisorFormSubmit}>
               <input value={supervisorForm.username} onChange={(event) => setSupervisorForm({ ...supervisorForm, username: event.target.value })} placeholder="اسم المستخدم" required />
               <input value={supervisorForm.password} onChange={(event) => setSupervisorForm({ ...supervisorForm, password: event.target.value })} placeholder={editingSupervisorId ? 'كلمة مرور جديدة (اختياري)' : 'كلمة المرور'} type="password" required={!editingSupervisorId} />
@@ -2932,8 +3219,30 @@ export default function AttendancePage() {
 
         {supervisorLoggedIn && sessionActive && (
           <section className="panel">
-            <div className="panel-header">
+            <div className="panel-header attendance-scanner-header">
               <span>جلسة الحضور النشطة</span>
+              <button
+                type="button"
+                className="action-button primary attendance-qr-scan-button"
+                onClick={() => { scannedQrStudentIdsRef.current.clear(); setQrScannerError(''); setShowQrScanner(true); }}
+              >
+                <ScanLine size={17} aria-hidden="true" />
+                <span>مسح QR للطالب</span>
+              </button>
+              <button
+                type="button"
+                className="action-button attendance-telegram-all-button"
+                onClick={() => void handleSendTelegramToAll()}
+                disabled={isSendingTelegramToAll || !students.some((student) => {
+                  const enabled = student.telegram_notifications_enabled ?? student['telegram_notifications_enabled'] ?? false;
+                  const isEnabled = typeof enabled === 'string'
+                    ? ['true', '1', 'yes'].includes(enabled.trim().toLowerCase())
+                    : Boolean(enabled);
+                  return isEnabled && Boolean(String(student.telegram_chat_id ?? student['telegram_chat_id'] ?? '').trim());
+                })}
+              >
+                {isSendingTelegramToAll ? 'جارٍ الإرسال للكل...' : 'إرسال تلجرام للكل'}
+              </button>
             </div>
 
             <div className="session-info">
@@ -2959,6 +3268,41 @@ export default function AttendancePage() {
               </div>
             </div>
 
+            {showQrScanner && (
+              <div className="attendance-qr-scanner-backdrop">
+                <section className="attendance-qr-scanner-dialog" role="dialog" aria-modal="true" aria-labelledby="attendance-qr-scanner-title">
+                  <div className="attendance-qr-scanner-heading">
+                    <div>
+                      <h2 id="attendance-qr-scanner-title">مسح باركود الطالب</h2>
+                      <p>وجّه كاميرا الجهاز نحو رمز QR الخاص بالطالب.</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="attendance-qr-scanner-close"
+                      onClick={() => setShowQrScanner(false)}
+                      aria-label="إغلاق ماسح QR"
+                    >
+                      إغلاق
+                    </button>
+                  </div>
+                  <div className={`attendance-qr-scan-success${qrScanSuccess ? ' is-visible' : ''}`} role="status" aria-live="polite">
+                    <CheckCircle2 size={19} aria-hidden="true" />
+                    <span>تم تسجيل حضور {scannedStudentName}</span>
+                  </div>
+                  <video ref={qrVideoRef} className={`attendance-qr-scanner-video${qrScanSuccess ? ' is-success' : ''}`} muted playsInline />
+                  {qrScannerLoading && <p className="attendance-qr-scanner-status">جارٍ تشغيل الكاميرا...</p>}
+                  {qrScannerError && (
+                    <div className="attendance-qr-scanner-error" role="alert">
+                      <span>{qrScannerError}</span>
+                      <button type="button" className="action-button primary" onClick={() => { setQrScannerError(''); setShowQrScanner(false); window.setTimeout(() => setShowQrScanner(true), 0); }}>
+                        إعادة المحاولة
+                      </button>
+                    </div>
+                  )}
+                </section>
+              </div>
+            )}
+
             <div className="student-grid">
               {students.map((student) => {
                 const studentId = getStudentIdentifier(student);
@@ -2978,19 +3322,13 @@ export default function AttendancePage() {
                       <button type="button" className="mini-btn success" onClick={() => updateStudentStatus(student, 'present')}>
                         حاضر
                       </button>
-                      <button type="button" className="mini-btn danger" onClick={() => updateStudentStatus(student, 'absent', 'غياب مبرر')}>
-                        غائب مبرر
-                      </button>
                       <button type="button" className="mini-btn danger" onClick={() => updateStudentStatus(student, 'absent', 'غياب غير مبرر')}>
-                        غائب غير مبرر
-                      </button>
-                      <button type="button" className="mini-btn" style={{ background: '#2563eb' }} onClick={() => void handleSendTelegramForStudent(student, status === 'present' ? 'حاضر' : status === 'absent' ? 'غائب' : 'تذكير بالحضور')}>
-                        إرسال تلجرام
+                        غياب
                       </button>
                     </div>
 
                     <div className={`status-pill ${status}`}>
-                      {status === 'present' ? 'حاضر' : status === 'absent' ? `غائب (${entry?.absenceReason || 'غياب مبرر'})` : 'بانتظار'}
+                      {status === 'present' ? 'حاضر' : status === 'absent' ? 'غائب' : 'بانتظار'}
                     </div>
 
                     {entry?.timestamp && <div className="timestamp">تم التسجيل: {entry.timestamp}</div>}
