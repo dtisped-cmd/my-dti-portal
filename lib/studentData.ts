@@ -50,6 +50,13 @@ export const normalizeText = (value: unknown) => {
   return String(value).trim();
 };
 
+export const normalizeStudentYear = (value: unknown): 'أولى' | 'ثانية' | '' => {
+  const year = String(value ?? '').trim().replace(/\s+/g, '').toLocaleLowerCase();
+  if (['1', '١'].includes(year) || year.includes('اولى') || year.includes('أولى') || year.includes('first')) return 'أولى';
+  if (['2', '٢'].includes(year) || year.includes('ثانية') || year.includes('second')) return 'ثانية';
+  return '';
+};
+
 export const decodeSupabaseArabicKey = (value: string) => {
   if (!value) return value;
   try {
@@ -179,15 +186,17 @@ const getStudentClassCounts = async () => {
 export const syncClassSeatCounts = async () => {
   const { data: classRowsData, error: classRowsError } = await supabase.from('الفئات').select('*');
   const { data: studentRowsData, error: studentRowsError } = await supabase.from('students').select('*');
+  const { data: academicClassRowsData, error: academicClassRowsError } = await supabase.from('student_classes').select('*');
 
-  if (classRowsError || studentRowsError) {
-    return { success: false, synced: 0, error: classRowsError?.message ?? studentRowsError?.message ?? 'unknown' };
+  if (classRowsError || studentRowsError || academicClassRowsError) {
+    return { success: false, synced: 0, error: classRowsError?.message ?? studentRowsError?.message ?? academicClassRowsError?.message ?? 'unknown' };
   }
 
   const classRows = Array.isArray(classRowsData) ? (classRowsData as Record<string, unknown>[]) : [];
   const studentRows = Array.isArray(studentRowsData) ? (studentRowsData as Record<string, unknown>[]) : [];
+  const academicClassRows = Array.isArray(academicClassRowsData) ? (academicClassRowsData as Record<string, unknown>[]) : [];
 
-  if (!classRows.length) return { success: true, synced: 0 };
+  if (!classRows.length && !academicClassRows.length) return { success: true, synced: 0 };
 
   const counts: Record<string, number> = {};
   for (const row of studentRows) {
@@ -227,12 +236,50 @@ export const syncClassSeatCounts = async () => {
     }
   }
 
+  for (const row of academicClassRows) {
+    const id = String(row.id ?? '').trim();
+    const className = String(row.name ?? '').trim();
+    const year = normalizeStudentYear(row.student_year);
+    if (!id || !className || !year) continue;
+    const occupied = studentRows.filter((student) => {
+      const studentRow = student as Record<string, unknown>;
+      return normalizeStudentYear(getRecordValue(studentRow, fieldAliases.year)) === year
+        && normalizeClassName(getRecordValue(studentRow, fieldAliases.className)) === normalizeClassName(className);
+    }).length;
+    const capacity = numericValueFromRow(row, ['capacity']);
+    const { error } = await supabase.from('student_classes').update({
+      occupied,
+      available_seats: capacity !== null ? Math.max(capacity - occupied, 0) : null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', id);
+    if (!error) synced += 1;
+  }
+
   return { success: true, synced };
 };
 
-export const getClassCapacityInfo = async (className: string): Promise<ClassCapacityInfo | null> => {
+export const getClassCapacityInfo = async (className: string, studentYear = ''): Promise<ClassCapacityInfo | null> => {
   const normalizedTarget = normalizeClassName(className);
+  const normalizedYear = normalizeStudentYear(studentYear);
+  if (studentYear && !normalizedYear) return null;
   const studentCounts = await getStudentClassCounts();
+
+  if (normalizedYear) {
+    const { data, error } = await supabase.from('student_classes').select('*').eq('student_year', normalizedYear);
+    if (error) throw error;
+    const row = ((data ?? []) as Record<string, unknown>[]).find((item) => normalizeClassName(item.name) === normalizedTarget);
+    if (!row) return null;
+    const capacity = numericValueFromRow(row, ['capacity']);
+    const matchingStudents = await getStudentsByClass(String(row.name), normalizedYear);
+    const occupied = matchingStudents.length;
+    return {
+      name: String(row.name),
+      capacity,
+      occupied,
+      available: capacity !== null ? Math.max(capacity - occupied, 0) : null,
+      tableName: 'student_classes',
+    };
+  }
 
   const { data, error } = await supabase.from('الفئات').select('*');
   if (error) {
@@ -268,7 +315,26 @@ export const getClassCapacityInfo = async (className: string): Promise<ClassCapa
   };
 };
 
-export const getClassAvailabilityOptions = async () => {
+export const getClassAvailabilityOptions = async (studentYear = '') => {
+  const normalizedYear = normalizeStudentYear(studentYear);
+  if (studentYear && !normalizedYear) return [];
+  if (normalizedYear) {
+    const { data, error } = await supabase.from('student_classes').select('*').eq('student_year', normalizedYear).order('name');
+    if (error) throw error;
+    const studentRows = await getTableRows(['students']);
+    const students = studentRows.data as StudentRow[];
+    return ((data ?? []) as Record<string, unknown>[]).map((row) => {
+      const name = normalizeClassName(row.name);
+      const capacity = numericValueFromRow(row, ['capacity']);
+      const occupied = students.filter((student) => {
+        const studentRow = student as Record<string, unknown>;
+        return normalizeStudentYear(getRecordValue(studentRow, fieldAliases.year)) === normalizedYear
+          && normalizeClassName(getRecordValue(studentRow, fieldAliases.className)) === name;
+      }).length;
+      return { name, capacity, occupied, available: capacity !== null ? Math.max(capacity - occupied, 0) : null };
+    });
+  }
+
   const studentCounts = await getStudentClassCounts();
   const { data, error } = await supabase.from('الفئات').select('*');
 
@@ -303,12 +369,15 @@ export const getClassAvailabilityOptions = async () => {
   return mappedRows;
 };
 
-export const updateStudentClass = async (studentId: string, nextClass: string) => {
+export const updateStudentClass = async (studentId: string, nextClass: string, studentYear = '') => {
   const trimmedId = String(studentId ?? '').trim();
   const normalizedNextClass = String(nextClass ?? '').trim();
   if (!trimmedId || !normalizedNextClass) return { success: false, error: 'missing-class-or-student' };
+  const normalizedYear = normalizeStudentYear(studentYear);
+  if (!normalizedYear) return { success: false, error: 'student-year-required' };
 
-  const classInfo = await getClassCapacityInfo(normalizedNextClass);
+  const classInfo = await getClassCapacityInfo(normalizedNextClass, normalizedYear);
+  if (!classInfo) return { success: false, error: 'class-not-available-for-student-year' };
   if (classInfo && classInfo.available !== null && classInfo.available <= 0) {
     return { success: false, error: 'class-full' };
   }
@@ -367,7 +436,7 @@ export const getStudentsByClass = async (classGroup: string, yearFilter = '') =>
     const classValue = normalizeText(getRecordValue(student as Record<string, unknown>, fieldAliases.className)).replace('فئة ', '');
     const yearValue = normalizeText(getRecordValue(student as Record<string, unknown>, fieldAliases.year));
     const classMatches = !classGroup || classValue === classGroup || classValue === `فئة ${classGroup}`;
-    const yearMatches = !yearFilter || yearValue === yearFilter;
+    const yearMatches = !yearFilter || normalizeStudentYear(yearValue) === normalizeStudentYear(yearFilter);
     return classMatches && yearMatches;
   });
 };
@@ -505,6 +574,17 @@ export const getWarningsForStudent = async (studentId: string) => {
     throw error;
   }
   return Array.isArray(data) ? data as Record<string, unknown>[] : [];
+};
+
+export const getTeacherAlertsForStudent = async (studentId: string, password: string) => {
+  const response = await fetch('/api/teacher-portal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'student-alerts', studentId: String(studentId).trim(), password }),
+  });
+  const result = await response.json() as { success?: boolean; alerts?: Record<string, unknown>[] };
+  if (!response.ok || !result.success) throw new Error('تعذر تحميل تنبيهات المدرسين.');
+  return result.alerts ?? [];
 };
 
 export const getAttendanceForStudent = async (studentId: string) => {

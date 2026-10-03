@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
 import { CheckCircle2, ScanLine, UserRound } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
@@ -40,8 +40,23 @@ type StudentRow = {
 
 type AttendanceStatus = 'pending' | 'present' | 'absent';
 type AbsenceReason = 'غياب مبرر' | 'غياب غير مبرر';
-type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile';
+type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile' | 'teacher_accounts' | 'teacher_management' | 'class_schedule';
 type AdminRecord = Record<string, unknown>;
+type AcademicTeacher = { id: string; teacher_name: string; is_active: boolean; login_username?: string | null };
+type AcademicSubject = { id: string; name: string; student_year: string; teacher_id: string };
+type AcademicClass = { id: string; name: string; student_year: string; capacity: number | null };
+type AcademicScheduleItem = {
+  id: string;
+  day: string;
+  start_time: string;
+  end_time: string;
+  subject: string;
+  type: string;
+  location: string;
+  group_name: string | null;
+  student_year: string | null;
+  teacher_id: string | null;
+};
 
 type AttendanceEntry = {
   id: string;
@@ -105,6 +120,7 @@ const courseOptions = [
 
 const classOptions = ['أ', 'ب', 'ج', 'د'];
 const yearOptions = ['أولى', 'ثانية'];
+const scheduleDayOptions = ['الأحد', 'الأثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
 const allowedStudentClasses = ['أ', 'ب', 'ج', 'د'];
 const allowedStudentYears = ['أولى', 'ثانية'];
 const defaultStudentSection = 'تعويضات أسنان';
@@ -126,6 +142,54 @@ const normalizeText = (value: unknown) => {
   if (value === null || value === undefined || value === '') return 'غير متوفر';
   return String(value).trim();
 };
+
+const auditUserTypeLabels: Record<string, string> = {
+  student: 'طالب',
+  teacher: 'مدرس',
+  supervisor: 'مشرف',
+  system: 'النظام',
+};
+
+const auditActionLabels: Record<string, string> = {
+  student_login: 'تسجيل دخول الطالب',
+  student_logout: 'تسجيل خروج الطالب',
+  student_account_updated: 'تعديل حساب الطالب',
+  student_avatar_updated: 'تغيير الصورة الشخصية',
+  student_password_reset: 'استعادة كلمة مرور الطالب',
+  student_telegram_preference_updated: 'تعديل إعدادات تنبيهات التليجرام',
+  student_telegram_linked: 'ربط حساب التليجرام',
+  student_skills_updated: 'تحديث مهارات الطالب',
+  student_class_changed: 'تغيير فئة الطالب',
+  student_id_changed: 'تغيير الرقم الجامعي',
+  student_tab_opened: 'فتح صفحة الطالب',
+  student_created_by_supervisor: 'إنشاء حساب طالب',
+  student_updated_by_supervisor: 'تعديل بيانات طالب',
+  teacher_login: 'تسجيل دخول المدرس',
+  teacher_logout: 'تسجيل خروج المدرس',
+  teacher_alert_created: 'إضافة تنبيه لطالب',
+  teacher_alert_deleted: 'حذف تنبيه طالب',
+  teacher_account_created: 'إنشاء حساب مدرس',
+  teacher_account_updated: 'تعديل حساب مدرس',
+  supervisor_login: 'تسجيل دخول المشرف',
+  supervisor_logout: 'تسجيل خروج المشرف',
+  supervisor_password_changed: 'تغيير كلمة مرور المشرف',
+  supervisor_created: 'إنشاء حساب مشرف',
+  supervisor_updated: 'تعديل حساب مشرف',
+  supervisor_deleted: 'حذف حساب مشرف',
+  attendance_session_started: 'بدء جلسة حضور',
+  attendance_session_saved: 'حفظ جلسة الحضور',
+  attendance_status_selected: 'تحديد حالة حضور طالب',
+  attendance_updated: 'تعديل سجل حضور',
+  attendance_deleted: 'حذف سجل حضور',
+  warning_to_attendance: 'تحويل إنذار إلى حضور',
+  attendance_to_warning: 'تحويل حضور إلى إنذار',
+  warning_updated: 'تعديل إنذار',
+  warning_deleted: 'حذف إنذار',
+  supervisor_warning_created: 'إضافة إنذار لمشرف',
+};
+
+const getAuditActionLabel = (action: string) => auditActionLabels[action]
+  ?? action.replace(/^academic_/, 'إدارة أكاديمية: ').replaceAll('_', ' ');
 
 const normalizeSupervisorDegree = (value: unknown) => {
   const text = normalizeText(value).replace(/\s+/g, '').toLowerCase();
@@ -190,7 +254,7 @@ const getSupervisorFeatures = (degree: string): SupervisorFeature[] => {
   const lowerDegree = normalizeText(degree).replace(/\s+/g, '').toLowerCase();
 
   if (normalizedDegree === '1' || ['moderator', 'مودرييتور', 'monitor', 'مراقب', 'المودرييتور'].includes(lowerDegree)) {
-    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'profile'];
+    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'profile', 'teacher_accounts', 'teacher_management', 'class_schedule'];
   }
 
   if (normalizedDegree === '2' || ['supervisor', 'سوبر', 'سوبرفايزور', 'super', 'supervisor2', 'fayzor', 'fayzur', 'فايزور', 'faizur'].includes(lowerDegree)) {
@@ -282,14 +346,27 @@ const loadAdminRecords = async () => {
   };
 };
 
-const loadAuditLogs = async () => {
-  const { data, error } = await supabase
-    .from('سجلات النظام')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(300);
-  if (error) throw error;
-  return Array.isArray(data) ? data as AdminRecord[] : [];
+const loadAuditLogs = async (username: string, password: string) => {
+  const response = await fetch('/api/audit-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mode: 'read',
+      username,
+      password,
+    }),
+  });
+  const result = await response.json() as { success?: boolean; error?: string; logs?: AdminRecord[] };
+  if (!response.ok || !result.success) {
+    const errorMessages: Record<string, string> = {
+      'audit-service-not-configured': 'خدمة السجلات غير مهيأة؛ تحقق من SUPABASE_SERVICE_ROLE_KEY.',
+      'supervisor-credentials-invalid': 'تعذر التحقق من حساب المشرف.',
+      'audit-access-denied': 'عرض السجلات متاح لمشرف الدرجة الأولى فقط.',
+      'audit-log-read-failed': 'تعذر قراءة سجلات النظام. تحقق من تشغيل supabase-audit-log.sql.',
+    };
+    throw new Error(errorMessages[result.error ?? ''] ?? 'تعذر تحميل سجلات النظام.');
+  }
+  return result.logs ?? [];
 };
 
 const insertAdminAttendance = async (warning: AdminRecord, supervisor: string) => {
@@ -473,6 +550,16 @@ const getTeacherEvaluationErrorText = (error: unknown) => {
     : message;
 };
 
+const teacherAccountErrorText = (code: string) => ({
+  'teacher-portal-server-key-missing': 'يجب إعداد مفتاح الخادم SUPABASE_SERVICE_ROLE_KEY أولاً.',
+  'supervisor-credentials-required': 'سجّل الخروج ثم ادخل مجددًا بحساب مشرف الدرجة الأولى.',
+  'supervisor-credentials-invalid': 'تعذر التحقق من حساب المشرف. أعد تسجيل الدخول.',
+  'teacher-accounts-load-failed': 'تعذر تحميل المدرسين. تأكد من تشغيل ملف supabase-teacher-portal.sql.',
+  'invalid-teacher-account': 'اسم المستخدم يجب أن يكون 3 محارف على الأقل وكلمة المرور 8 محارف على الأقل.',
+  'teacher-account-save-failed': 'تعذر حفظ الحساب؛ ربما اسم المستخدم مستخدم من مدرس آخر.',
+  'teacher-not-found': 'المدرس المحدد لم يعد موجودًا. حدّث القائمة ثم أعد المحاولة.',
+}[code] ?? 'حدث خطأ أثناء إدارة حساب المدرس.');
+
 const isDuplicateStudentIdError = (error: unknown) => {
   if (!error || typeof error !== 'object') return false;
 
@@ -508,8 +595,8 @@ const normalizeStudentYearValue = (value: string) => {
   const raw = String(value ?? '').trim();
   if (!raw) return '';
   const normalized = raw.toLowerCase().replace(/\s+/g, '');
-  if (['1', 'اولى', 'أولى', 'first'].includes(normalized)) return 'أولى';
-  if (['2', 'ثانية', 'second'].includes(normalized)) return 'ثانية';
+  if (['1', '١'].includes(normalized) || normalized.includes('اولى') || normalized.includes('أولى') || normalized.includes('first')) return 'أولى';
+  if (['2', '٢'].includes(normalized) || normalized.includes('ثانية') || normalized.includes('second')) return 'ثانية';
   return '';
 };
 
@@ -531,9 +618,7 @@ const getStudentValidationError = (draft: Record<string, string>) => {
 
   const rawClassValue = String(draft['الفئة'] ?? '').trim();
   const classValue = normalizeStudentClassValue(rawClassValue);
-  if (rawClassValue && rawClassValue !== 'بدون فئة' && classValue && !allowedStudentClasses.includes(classValue as typeof allowedStudentClasses[number])) {
-    return 'الفئة يجب أن تكون واحدة من: أ، ب، ج، د فقط';
-  }
+  if (rawClassValue && rawClassValue !== 'بدون فئة' && (!classValue || rawClassValue.length > 80)) return 'اسم الفئة غير صالح';
 
   const yearValue = normalizeStudentYearValue(String(draft['السنه الدراسية'] ?? ''));
   if (!yearValue || !allowedStudentYears.includes(yearValue as typeof allowedStudentYears[number])) {
@@ -545,6 +630,11 @@ const getStudentValidationError = (draft: Record<string, string>) => {
   }
 
   return '';
+};
+
+const getClassOptionsForYear = (classes: AcademicClass[], loaded: boolean, year: string) => {
+  if (!loaded) return allowedStudentClasses;
+  return classes.filter((item) => item.student_year === year).map((item) => item.name);
 };
 
 const normalizeStudentDraftValues = (draft: Record<string, string>) => {
@@ -958,6 +1048,7 @@ export default function AttendancePage() {
   const scannedQrStudentIdsRef = useRef<Set<string>>(new Set());
   const qrScanSuccessTimerRef = useRef<number | null>(null);
   const [supervisorLoggedIn, setSupervisorLoggedIn] = useState(false);
+  const [supervisorSessionReady, setSupervisorSessionReady] = useState(false);
   const [supervisorUsername, setSupervisorUsername] = useState<string>('');
   const [supervisorPassword, setSupervisorPassword] = useState('');
   const [rememberSupervisorCredentials, setRememberSupervisorCredentials] = useState(true);
@@ -974,6 +1065,9 @@ export default function AttendancePage() {
   const [adminSupervisorWarnings, setAdminSupervisorWarnings] = useState<AdminRecord[]>([]);
   const [supervisorRecords, setSupervisorRecords] = useState<AdminRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AdminRecord[]>([]);
+  const [auditLogSearch, setAuditLogSearch] = useState('');
+  const [auditLogUserType, setAuditLogUserType] = useState('all');
+  const [auditLogActionType, setAuditLogActionType] = useState('all');
   const [supervisorForm, setSupervisorForm] = useState({ username: '', password: '', degree: '3' });
   const [supervisorProfileForm, setSupervisorProfileForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [supervisorProfileLoading, setSupervisorProfileLoading] = useState(false);
@@ -986,6 +1080,39 @@ export default function AttendancePage() {
   const [teacherEvaluationReportTeachers, setTeacherEvaluationReportTeachers] = useState<AdminRecord[]>([]);
   const [teacherEvaluationReportRows, setTeacherEvaluationReportRows] = useState<AdminRecord[]>([]);
   const [teacherEvaluationReportError, setTeacherEvaluationReportError] = useState('');
+  const [teacherAccountRows, setTeacherAccountRows] = useState<AdminRecord[]>([]);
+  const [teacherAccountDrafts, setTeacherAccountDrafts] = useState<Record<string, { name: string; username: string; password: string; isActive: boolean }>>({});
+  const [selectedTeacherAccountId, setSelectedTeacherAccountId] = useState('');
+  const [creatingTeacherAccount, setCreatingTeacherAccount] = useState(false);
+  const [newTeacherAccountDraft, setNewTeacherAccountDraft] = useState({ name: '', username: '', password: '', isActive: true });
+  const [teacherAccountLoading, setTeacherAccountLoading] = useState(false);
+  const [savingTeacherAccountId, setSavingTeacherAccountId] = useState('');
+  const [teacherAccountNotice, setTeacherAccountNotice] = useState('');
+  const [teacherAccountNoticeType, setTeacherAccountNoticeType] = useState<'error' | 'success'>('success');
+  const [academicTeachers, setAcademicTeachers] = useState<AcademicTeacher[]>([]);
+  const [academicSubjects, setAcademicSubjects] = useState<AcademicSubject[]>([]);
+  const [academicClasses, setAcademicClasses] = useState<AcademicClass[]>([]);
+  const [academicSchedule, setAcademicSchedule] = useState<AcademicScheduleItem[]>([]);
+  const [academicManagementLoading, setAcademicManagementLoading] = useState(false);
+  const [academicManagementLoaded, setAcademicManagementLoaded] = useState(false);
+  const [academicManagementSaving, setAcademicManagementSaving] = useState(false);
+  const [academicManagementNotice, setAcademicManagementNotice] = useState('');
+  const [academicManagementNoticeType, setAcademicManagementNoticeType] = useState<'error' | 'success'>('success');
+  const [teacherDraft, setTeacherDraft] = useState({ id: '', name: '', username: '', password: '', isActive: true });
+  const [subjectDraft, setSubjectDraft] = useState({ id: '', name: '', studentYear: 'أولى', teacherId: '' });
+  const [classDraft, setClassDraft] = useState({ id: '', name: '', studentYear: 'أولى', capacity: '' });
+  const [scheduleDraft, setScheduleDraft] = useState({
+    id: '',
+    studentYear: 'أولى',
+    subject: '',
+    teacherId: '',
+    day: 'الأحد',
+    startTime: '',
+    endTime: '',
+    type: 'محاضرة',
+    location: '',
+    groupName: '',
+  });
   const [editingSupervisorId, setEditingSupervisorId] = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminSearch, setAdminSearch] = useState('');
@@ -1085,6 +1212,8 @@ export default function AttendancePage() {
       }
     } catch {
       window.localStorage.removeItem(supervisorSessionStorageKey);
+    } finally {
+      setSupervisorSessionReady(true);
     }
   }, []);
 
@@ -1128,9 +1257,14 @@ export default function AttendancePage() {
   };
 
   const refreshAuditLogs = async () => {
+    const password = supervisorPassword || window.prompt('أدخل كلمة مرور المشرف للتحقق من صلاحية عرض السجلات:') || '';
+    if (!password) {
+      setNotice('أدخل كلمة مرور المشرف لعرض السجلات.');
+      return;
+    }
     setAdminLoading(true);
     try {
-      setAuditLogs(await loadAuditLogs());
+      setAuditLogs(await loadAuditLogs(supervisorUsername, password));
     } catch (error) {
       setNotice(`تعذر تحميل سجلات النظام: ${getSupabaseErrorText(error)}`);
     } finally {
@@ -1148,6 +1282,315 @@ export default function AttendancePage() {
       setNotice(`تعذر تحميل بيانات الطلاب: ${getSupabaseErrorText(error)}`);
     } finally {
       setAdminLoading(false);
+    }
+  };
+
+  const refreshTeacherAccounts = useCallback(async () => {
+    setTeacherAccountLoading(true);
+    setTeacherAccountNotice('');
+    setTeacherAccountNoticeType('success');
+    try {
+      const response = await fetch('/api/teacher-portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'list-accounts',
+          supervisorUsername,
+          supervisorPassword,
+        }),
+      });
+      const result = await response.json() as {
+        success?: boolean;
+        error?: string;
+        teachers?: Array<{ id: string; teacher_name: string; subjects: string[]; is_active: boolean; login_username?: string | null }>;
+      };
+      if (!response.ok || !result.success) throw new Error(teacherAccountErrorText(result.error ?? ''));
+      const rows = result.teachers ?? [];
+      setTeacherAccountRows(rows as AdminRecord[]);
+      setTeacherAccountDrafts(Object.fromEntries(rows.map((teacher) => [
+        teacher.id,
+        {
+          name: teacher.teacher_name,
+          username: teacher.login_username ?? '',
+          password: '',
+          isActive: teacher.is_active,
+        },
+      ])));
+      setSelectedTeacherAccountId((current) => rows.some((teacher) => teacher.id === current) ? current : rows[0]?.id ?? '');
+    } catch (error) {
+      setTeacherAccountNoticeType('error');
+      setTeacherAccountNotice(error instanceof Error ? error.message : 'تعذر تحميل حسابات المدرسين.');
+    } finally {
+      setTeacherAccountLoading(false);
+    }
+  }, [supervisorUsername, supervisorPassword]);
+
+  const saveTeacherAccount = async (teacherId: string) => {
+    const draft = teacherAccountDrafts[teacherId];
+    if (!draft) return;
+    setSavingTeacherAccountId(teacherId);
+    setTeacherAccountNotice('');
+    setTeacherAccountNoticeType('success');
+    try {
+      const response = await fetch('/api/teacher-portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'set-account',
+          supervisorUsername,
+          supervisorPassword,
+          teacherId,
+          teacherName: draft.name.trim(),
+          loginUsername: draft.username.trim(),
+          newPassword: draft.password,
+          isActive: draft.isActive,
+        }),
+      });
+      const result = await response.json() as {
+        success?: boolean;
+        error?: string;
+        teacher?: { id: string; teacher_name: string; subjects: string[]; is_active: boolean; login_username?: string | null };
+      };
+      if (!response.ok || !result.success || !result.teacher) throw new Error(teacherAccountErrorText(result.error ?? ''));
+      const savedTeacher = result.teacher;
+      writeAuditLog({
+        action: 'teacher_account_updated',
+        userType: 'supervisor',
+        username: supervisorUsername,
+        fullName: supervisorUsername,
+        details: {
+          teacherId: savedTeacher.id,
+          teacherName: savedTeacher.teacher_name,
+          loginUsername: savedTeacher.login_username,
+          isActive: savedTeacher.is_active,
+          passwordChanged: Boolean(draft.password),
+        },
+      });
+      setTeacherAccountRows((current) => current.map((row) => String(row.id) === teacherId ? savedTeacher as AdminRecord : row));
+      setTeacherAccountDrafts((current) => ({
+        ...current,
+        [teacherId]: {
+          name: savedTeacher.teacher_name,
+          username: savedTeacher.login_username ?? draft.username,
+          password: '',
+          isActive: savedTeacher.is_active,
+        },
+      }));
+      setTeacherAccountNoticeType('success');
+      setTeacherAccountNotice(`تم تحديث بيانات ${savedTeacher.teacher_name} وحساب دخوله.`);
+    } catch (error) {
+      setTeacherAccountNoticeType('error');
+      setTeacherAccountNotice(error instanceof Error ? error.message : 'تعذر حفظ حساب المدرس.');
+    } finally {
+      setSavingTeacherAccountId('');
+    }
+  };
+
+  const createTeacherAccount = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSavingTeacherAccountId('new');
+    setTeacherAccountNotice('');
+    setTeacherAccountNoticeType('success');
+    try {
+      const response = await fetch('/api/teacher-portal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'set-account',
+          supervisorUsername,
+          supervisorPassword,
+          teacherName: newTeacherAccountDraft.name.trim(),
+          loginUsername: newTeacherAccountDraft.username.trim(),
+          newPassword: newTeacherAccountDraft.password,
+          isActive: newTeacherAccountDraft.isActive,
+        }),
+      });
+      const result = await response.json() as {
+        success?: boolean;
+        error?: string;
+        teacher?: { id: string; teacher_name: string; subjects: string[]; is_active: boolean; login_username?: string | null };
+      };
+      if (!response.ok || !result.success || !result.teacher) throw new Error(teacherAccountErrorText(result.error ?? ''));
+      const createdTeacher = result.teacher;
+      writeAuditLog({
+        action: 'teacher_account_created',
+        userType: 'supervisor',
+        username: supervisorUsername,
+        fullName: supervisorUsername,
+        details: {
+          teacherId: createdTeacher.id,
+          teacherName: createdTeacher.teacher_name,
+          loginUsername: createdTeacher.login_username,
+          isActive: createdTeacher.is_active,
+          passwordSet: true,
+        },
+      });
+      setTeacherAccountRows((current) => [...current, createdTeacher as AdminRecord]);
+      setSelectedTeacherAccountId(createdTeacher.id);
+      setTeacherAccountDrafts((current) => ({
+        ...current,
+        [createdTeacher.id]: {
+          name: createdTeacher.teacher_name,
+          username: createdTeacher.login_username ?? '',
+          password: '',
+          isActive: createdTeacher.is_active,
+        },
+      }));
+      setNewTeacherAccountDraft({ name: '', username: '', password: '', isActive: true });
+      setCreatingTeacherAccount(false);
+      setTeacherAccountNoticeType('success');
+      setTeacherAccountNotice(`تم إنشاء حساب المدرس ${createdTeacher.teacher_name}.`);
+    } catch (error) {
+      setTeacherAccountNoticeType('error');
+      setTeacherAccountNotice(error instanceof Error ? error.message : 'تعذر إنشاء حساب المدرس.');
+    } finally {
+      setSavingTeacherAccountId('');
+    }
+  };
+
+  const academicManagementRequest = useCallback(async (payload: Record<string, unknown>) => {
+    const response = await fetch('/api/supervisor/academic-management', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, supervisorUsername, supervisorPassword }),
+    });
+    const result = await response.json() as {
+      success?: boolean;
+      error?: string;
+      message?: string;
+      code?: string;
+      teachers?: AcademicTeacher[];
+      subjects?: AcademicSubject[];
+      classes?: AcademicClass[];
+      schedule?: AcademicScheduleItem[];
+    };
+    if (!response.ok || !result.success) {
+      const messages: Record<string, string> = {
+        'academic-management-server-key-missing': 'يجب إعداد مفتاح الخادم SUPABASE_SERVICE_ROLE_KEY.',
+        'supervisor-credentials-invalid': 'تعذر التحقق من صلاحية المشرف.',
+        'academic-management-load-failed': 'تعذر تحميل المدرسين والفئات والبرنامج. تأكد من تشغيل ملف supabase-academic-management.sql.',
+        'subject-assignment-required': 'عيّن المادة لمدرس قبل إضافتها إلى البرنامج.',
+        'class-in-use': 'لا يمكن حذف الفئة أو تغيير اسمها/سنتها ما دام فيها طلاب أو مواعيد برنامج.',
+        'invalid-teacher-account': 'اسم المستخدم يجب أن يكون 3 محارف على الأقل وكلمة المرور 8 محارف على الأقل.',
+      };
+      const friendlyMessage = messages[result.error ?? ''];
+      const detail = result.message ? `\nالتفاصيل: ${result.message}${result.code ? ` (${result.code})` : ''}` : '';
+      throw new Error(`${friendlyMessage ?? `تعذر تنفيذ العملية (${result.error ?? 'unknown'}).`}${detail}`);
+    }
+    if (payload.action !== 'list') {
+      const safeDetails = Object.fromEntries(
+        Object.entries(payload).filter(([key]) => !/password|secret|token/i.test(key))
+      );
+      writeAuditLog({
+        action: `academic_${String(payload.action ?? 'updated')}`,
+        userType: 'supervisor',
+        username: supervisorUsername,
+        fullName: supervisorUsername,
+        details: safeDetails,
+      });
+    }
+    return result;
+  }, [supervisorUsername, supervisorPassword]);
+
+  const refreshAcademicManagement = useCallback(async () => {
+    setAcademicManagementLoading(true);
+    setAcademicManagementNotice('');
+    try {
+      const result = await academicManagementRequest({ action: 'list' });
+      setAcademicTeachers(result.teachers ?? []);
+      setAcademicSubjects(result.subjects ?? []);
+      setAcademicClasses(result.classes ?? []);
+      setAcademicSchedule(result.schedule ?? []);
+      setAcademicManagementNoticeType('success');
+      const yearSubjects = (result.subjects ?? []).filter((item) => item.student_year === selectedYear);
+      const yearClasses = (result.classes ?? []).filter((item) => item.student_year === selectedYear);
+      setSelectedCourse((current) => yearSubjects.some((item) => item.name === current) ? current : yearSubjects[0]?.name ?? '');
+      setSelectedClass((current) => yearClasses.some((item) => item.name === current) ? current : yearClasses[0]?.name ?? '');
+      setAcademicManagementLoaded(true);
+    } catch (error) {
+      setAcademicManagementNoticeType('error');
+      setAcademicManagementNotice(error instanceof Error ? error.message : 'تعذر تحميل البيانات الأكاديمية.');
+      return false;
+    } finally {
+      setAcademicManagementLoading(false);
+    }
+    return true;
+  }, [academicManagementRequest, selectedYear]);
+
+  const runAcademicAction = async (payload: Record<string, unknown>, successMessage: string) => {
+    setAcademicManagementSaving(true);
+    setAcademicManagementNotice('');
+    try {
+      await academicManagementRequest(payload);
+      if (!await refreshAcademicManagement()) return false;
+      setAcademicManagementNoticeType('success');
+      setAcademicManagementNotice(successMessage);
+      return true;
+    } catch (error) {
+      setAcademicManagementNoticeType('error');
+      setAcademicManagementNotice(error instanceof Error ? error.message : 'تعذر حفظ التغييرات.');
+      return false;
+    } finally {
+      setAcademicManagementSaving(false);
+    }
+  };
+
+  const saveAcademicTeacher = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (await runAcademicAction({
+      action: 'save-teacher',
+      id: teacherDraft.id || undefined,
+      teacherName: teacherDraft.name,
+      loginUsername: teacherDraft.username,
+      newPassword: teacherDraft.password,
+      isActive: teacherDraft.isActive,
+    }, teacherDraft.id ? 'تم حفظ بيانات المدرس.' : 'تم إنشاء حساب المدرس بنجاح.')) {
+      setTeacherDraft({ id: '', name: '', username: '', password: '', isActive: true });
+    }
+  };
+
+  const saveAcademicSubject = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (await runAcademicAction({
+      action: 'save-subject',
+      id: subjectDraft.id || undefined,
+      name: subjectDraft.name,
+      studentYear: subjectDraft.studentYear,
+      teacherId: subjectDraft.teacherId,
+    }, 'تم حفظ المادة وربطها بالمدرس والسنة.')) {
+      setSubjectDraft({ id: '', name: '', studentYear: 'أولى', teacherId: '' });
+    }
+  };
+
+  const saveAcademicClass = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (await runAcademicAction({
+      action: 'save-class',
+      id: classDraft.id || undefined,
+      name: classDraft.name,
+      studentYear: classDraft.studentYear,
+      capacity: classDraft.capacity,
+    }, 'تم حفظ الفئة.')) {
+      setClassDraft({ id: '', name: '', studentYear: 'أولى', capacity: '' });
+    }
+  };
+
+  const saveAcademicSchedule = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (await runAcademicAction({
+      action: 'save-schedule',
+      id: scheduleDraft.id || undefined,
+      studentYear: scheduleDraft.studentYear,
+      subject: scheduleDraft.subject,
+      teacherId: scheduleDraft.teacherId,
+      day: scheduleDraft.day,
+      startTime: scheduleDraft.startTime,
+      endTime: scheduleDraft.endTime,
+      type: scheduleDraft.type,
+      location: scheduleDraft.location,
+      groupName: scheduleDraft.groupName,
+    }, 'تم حفظ موعد البرنامج.')) {
+      setScheduleDraft((current) => ({ ...current, id: '', startTime: '', endTime: '', location: '', groupName: '' }));
     }
   };
 
@@ -1353,6 +1796,19 @@ export default function AttendancePage() {
     console.log('[attendance][student-update] success', data);
 
     setNotice('تم تحديث بيانات الطالب بنجاح');
+    writeAuditLog({
+      action: 'student_updated_by_supervisor',
+      userType: 'supervisor',
+      username: supervisorUsername,
+      fullName: supervisorUsername,
+      details: {
+        studentId: nextStudentId,
+        studentName: getFullStudentName(originalStudent ?? {}),
+        changedFields: changedFields.filter((field) => !/كلمة السر|password/i.test(field)),
+        classBefore: originalStudent?.['الفئة'],
+        classAfter: cleanPayload['الفئة'] ?? originalStudent?.['الفئة'],
+      },
+    });
     setEditingStudentId('');
     setEditingStudentDraft({});
     await refreshStudentDirectory();
@@ -1443,6 +1899,23 @@ export default function AttendancePage() {
         return;
       }
 
+      const createdStudentName = [
+        payload['اسم الطالب'],
+        payload['اسم الاب'],
+        payload['الكنية'],
+      ].filter(Boolean).join(' ');
+      writeAuditLog({
+        action: 'student_created_by_supervisor',
+        userType: 'supervisor',
+        username: supervisorUsername,
+        fullName: supervisorUsername,
+        details: {
+          studentId: payload['الرقم الجامعي'],
+          studentName: createdStudentName,
+          className: payload['الفئة'] ?? 'بلا فئة',
+          year: payload['السنه الدراسية'],
+        },
+      });
       setNotice('تم إنشاء حساب الطالب بنجاح');
       setShowCreateStudentForm(false);
       setNewStudentForm({
@@ -1543,6 +2016,38 @@ export default function AttendancePage() {
       return matchesSearch && matchesClass && matchesYear && matchesSection;
     });
   }, [studentDirectory, studentDirectorySearch, studentClassFilter, studentYearFilter, studentSectionFilter]);
+
+  const filteredAuditLogs = useMemo(() => {
+    const searchTerm = auditLogSearch.trim().toLocaleLowerCase();
+    return auditLogs.filter((log) => {
+      const userType = String(getAdminRecordValue(log, ['user_type']) ?? '');
+      const action = String(getAdminRecordValue(log, ['action']) ?? '');
+      const details = getAdminRecordValue(log, ['details']);
+      const detailsRecord = details && typeof details === 'object' && !Array.isArray(details)
+        ? details as Record<string, unknown>
+        : {};
+      const detailSearchableText = typeof details === 'string' ? details : JSON.stringify(details ?? {});
+      const searchableText = [
+        getAdminRecordValue(log, ['full_name']),
+        getAdminRecordValue(log, ['username']),
+        getAdminRecordValue(log, ['user_id']),
+        getAdminRecordValue(log, ['ip_address']),
+        getAdminRecordValue(log, ['path']),
+        action,
+        detailSearchableText,
+      ].join(' ').toLocaleLowerCase();
+      const matchesUser = auditLogUserType === 'all' || userType === auditLogUserType;
+      const matchesAction = auditLogActionType === 'all'
+        || (auditLogActionType === 'authentication' && /_(login|logout)$/.test(action))
+        || (auditLogActionType === 'password' && (/password/.test(action) || detailsRecord.passwordChanged === true))
+        || (auditLogActionType === 'class' && (/class|الفئة/.test(action) || /class|الفئة/.test(detailSearchableText)))
+        || (auditLogActionType === 'attendance' && /attendance|warning/.test(action))
+        || (auditLogActionType === 'management' && /academic_|teacher_account|supervisor_(created|updated|deleted)/.test(action))
+        || (auditLogActionType === 'accounts' && /student_(created|updated)|account/.test(action))
+        || (auditLogActionType === 'other' && !/_(login|logout)$|password|class|attendance|warning|created|updated|deleted|account|academic_/.test(action));
+      return matchesUser && matchesAction && (!searchTerm || searchableText.includes(searchTerm));
+    });
+  }, [auditLogs, auditLogSearch, auditLogUserType, auditLogActionType]);
 
   const selectedStudentAttendance = selectedAdminStudentId
     ? filteredAdminAttendance.filter((record) => String(getAdminRecordValue(record, ['الرقم الجامعي', 'student_id', 'studentId'])) === selectedAdminStudentId)
@@ -1820,6 +2325,24 @@ export default function AttendancePage() {
       void refreshTeacherEvaluationSetting();
     }
   }, [supervisorLoggedIn, selectedFeature]);
+
+  useEffect(() => {
+    if (supervisorLoggedIn && selectedFeature === 'teacher_accounts') {
+      void refreshTeacherAccounts();
+    }
+  }, [supervisorLoggedIn, selectedFeature, refreshTeacherAccounts]);
+
+  useEffect(() => {
+    if (supervisorLoggedIn && (
+      selectedFeature === 'teacher_management'
+      || selectedFeature === 'class_schedule'
+      || selectedFeature === 'attendance'
+      || selectedFeature === 'students'
+      || selectedFeature === 'create_student'
+    )) {
+      void refreshAcademicManagement();
+    }
+  }, [supervisorLoggedIn, selectedFeature, refreshAcademicManagement]);
 
   const handleSupervisorLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2387,12 +2910,15 @@ export default function AttendancePage() {
               ← العودة للوحة التحكم
             </button>
           ) : (
-            <Link
-              href="/"
-              className="inline-flex items-center gap-2 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-semibold transition-all cursor-pointer z-50"
-            >
-              ← العودة للصفحة الرئيسية
-            </Link>
+            <div className="attendance-entry-links">
+              <Link
+                href="/"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded-lg font-semibold transition-all cursor-pointer z-50"
+              >
+                ← العودة للصفحة الرئيسية
+              </Link>
+              <Link href="/teacher" className="attendance-teacher-link">دخول المدرسين</Link>
+            </div>
           )}
           {supervisorLoggedIn && (
             <div
@@ -2472,7 +2998,9 @@ export default function AttendancePage() {
           </div>
         )}
 
-        {!supervisorLoggedIn && (
+        {!supervisorSessionReady && <div className="loading-box">جارٍ استعادة جلسة المشرف...</div>}
+
+        {supervisorSessionReady && !supervisorLoggedIn && (
           <section className="panel">
             <div className="panel-header">
               <span>تسجيل دخول المشرف</span>
@@ -2532,7 +3060,7 @@ export default function AttendancePage() {
 
         {notice && <div className="notice-box">{notice}</div>}
 
-        {!supervisorLoggedIn && <div className="loading-box">يجب تسجيل دخول المشرف قبل استخدام نظام الحضور والغياب</div>}
+        {supervisorSessionReady && !supervisorLoggedIn && <div className="loading-box">يجب تسجيل دخول المشرف قبل استخدام نظام الحضور والغياب</div>}
 
         {supervisorLoggedIn && !selectedFeature && (
           <section className="supervisor-feature-panel">
@@ -2630,6 +3158,42 @@ export default function AttendancePage() {
                   <span className="feature-arrow" aria-hidden="true">←</span>
                 </button>
               )}
+              {supervisorFeatures.includes('teacher_accounts') && (
+                <button type="button" className="supervisor-feature-card" onClick={() => {
+                  setSelectedFeature('teacher_accounts');
+                  const stored = JSON.parse(window.localStorage.getItem(supervisorSessionStorageKey) || '{}') as StoredSupervisorSession;
+                  window.localStorage.setItem(supervisorSessionStorageKey, JSON.stringify({ ...stored, selectedFeature: 'teacher_accounts' }));
+                  writeAuditLog({ action: 'feature_opened', userType: 'supervisor', username: supervisorUsername, details: { feature: 'teacher_accounts' } });
+                }}>
+                  <span className="feature-icon" aria-hidden="true">✎</span>
+                  <span><strong>حسابات المدرسين</strong><small>إعداد اسم المستخدم وكلمة المرور لكل مدرس</small></span>
+                  <span className="feature-arrow" aria-hidden="true">←</span>
+                </button>
+              )}
+              {supervisorFeatures.includes('teacher_management') && (
+                <button type="button" className="supervisor-feature-card" onClick={() => {
+                  setSelectedFeature('teacher_management');
+                  const stored = JSON.parse(window.localStorage.getItem(supervisorSessionStorageKey) || '{}') as StoredSupervisorSession;
+                  window.localStorage.setItem(supervisorSessionStorageKey, JSON.stringify({ ...stored, selectedFeature: 'teacher_management' }));
+                  writeAuditLog({ action: 'feature_opened', userType: 'supervisor', username: supervisorUsername, details: { feature: 'teacher_management' } });
+                }}>
+                  <span className="feature-icon" aria-hidden="true">✎</span>
+                  <span><strong>إدارة المدرسين والمواد</strong><small>إضافة وتعديل وحذف المدرسين وتعيين موادهم وسنواتها</small></span>
+                  <span className="feature-arrow" aria-hidden="true">←</span>
+                </button>
+              )}
+              {supervisorFeatures.includes('class_schedule') && (
+                <button type="button" className="supervisor-feature-card" onClick={() => {
+                  setSelectedFeature('class_schedule');
+                  const stored = JSON.parse(window.localStorage.getItem(supervisorSessionStorageKey) || '{}') as StoredSupervisorSession;
+                  window.localStorage.setItem(supervisorSessionStorageKey, JSON.stringify({ ...stored, selectedFeature: 'class_schedule' }));
+                  writeAuditLog({ action: 'feature_opened', userType: 'supervisor', username: supervisorUsername, details: { feature: 'class_schedule' } });
+                }}>
+                  <span className="feature-icon" aria-hidden="true">▦</span>
+                  <span><strong>إدارة الفئات والبرنامج</strong><small>إنشاء الفئات حسب السنة الدراسية وإدارة مواعيد البرنامج</small></span>
+                  <span className="feature-arrow" aria-hidden="true">←</span>
+                </button>
+              )}
               {supervisorFeatures.includes('logs') && (
                 <button type="button" className="supervisor-feature-card" onClick={() => {
                   setSelectedFeature('logs');
@@ -2655,6 +3219,294 @@ export default function AttendancePage() {
                 <span className="feature-arrow" aria-hidden="true">←</span>
               </button>
             </div>
+          </section>
+        )}
+
+        {supervisorLoggedIn && selectedFeature === 'teacher_accounts' && (
+          <section className="admin-dashboard-panel teacher-account-management">
+            <div className="admin-dashboard-heading">
+              <div>
+                <span className="feature-panel-kicker">إدارة حسابات الدخول</span>
+                <h1>حسابات المدرسين</h1>
+                <p>أنشئ حساب المدرس ببياناته الكاملة، أو اختر مدرسًا موجودًا لتعديل اسمه وبيانات دخوله.</p>
+              </div>
+              <button type="button" className="action-button primary" onClick={() => void refreshTeacherAccounts()} disabled={teacherAccountLoading}>
+                {teacherAccountLoading ? 'جارٍ التحديث...' : 'تحديث القائمة'}
+              </button>
+            </div>
+            {teacherAccountNotice && <p className={`teacher-account-notice ${teacherAccountNoticeType}`} role={teacherAccountNoticeType === 'error' ? 'alert' : 'status'}>{teacherAccountNotice}</p>}
+            {teacherAccountLoading ? (
+              <div className="loading-box">جارٍ تحميل المدرسين...</div>
+            ) : (
+              <>
+                <div className="teacher-account-toolbar">
+                  <label>
+                    <span>اختر مدرسًا لتعديل بياناته</span>
+                    <select
+                      value={selectedTeacherAccountId}
+                      onChange={(event) => {
+                        setSelectedTeacherAccountId(event.target.value);
+                        setCreatingTeacherAccount(false);
+                      }}
+                      disabled={!teacherAccountRows.length}
+                    >
+                      <option value="">اختر مدرسًا</option>
+                      {teacherAccountRows.map((row) => (
+                        <option key={String(row.id)} value={String(row.id)}>
+                          {String(row.teacher_name ?? 'مدرس')} {row.login_username ? `(@${String(row.login_username)})` : '(لم يكتمل حساب الدخول)'}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button type="button" className="action-button primary" onClick={() => {
+                    setCreatingTeacherAccount(true);
+                    setSelectedTeacherAccountId('');
+                    setNewTeacherAccountDraft({ name: '', username: '', password: '', isActive: true });
+                    setTeacherAccountNotice('');
+                  }}>
+                    + إضافة مدرس جديد
+                  </button>
+                </div>
+                {creatingTeacherAccount ? (
+                  <form className="teacher-account-card teacher-management-form" onSubmit={createTeacherAccount}>
+                    <h2>إنشاء حساب مدرس جديد</h2>
+                    <label><span>الاسم الكامل</span><input value={newTeacherAccountDraft.name} onChange={(event) => setNewTeacherAccountDraft((current) => ({ ...current, name: event.target.value }))} maxLength={160} autoComplete="name" required /></label>
+                    <label><span>اسم المستخدم</span><input value={newTeacherAccountDraft.username} onChange={(event) => setNewTeacherAccountDraft((current) => ({ ...current, username: event.target.value }))} minLength={3} maxLength={80} autoComplete="username" required /></label>
+                    <label><span>كلمة المرور <small>8 محارف على الأقل</small></span><input type="password" value={newTeacherAccountDraft.password} onChange={(event) => setNewTeacherAccountDraft((current) => ({ ...current, password: event.target.value }))} minLength={8} autoComplete="new-password" required /></label>
+                    <label className="checkbox-label"><input type="checkbox" checked={newTeacherAccountDraft.isActive} onChange={(event) => setNewTeacherAccountDraft((current) => ({ ...current, isActive: event.target.checked }))} /> حساب المدرس فعال</label>
+                    <div className="student-directory-actions">
+                      <button type="submit" className="action-button primary" disabled={savingTeacherAccountId === 'new'}>{savingTeacherAccountId === 'new' ? 'جارٍ الإنشاء...' : 'إنشاء حساب المدرس'}</button>
+                      <button type="button" className="action-button" onClick={() => setCreatingTeacherAccount(false)}>إلغاء</button>
+                    </div>
+                  </form>
+                ) : selectedTeacherAccountId ? (() => {
+                  const selectedTeacher = teacherAccountRows.find((row) => String(row.id) === selectedTeacherAccountId);
+                  const draft = teacherAccountDrafts[selectedTeacherAccountId];
+                  if (!selectedTeacher || !draft) return <div className="loading-box">اختر مدرسًا من القائمة لتعديل بياناته.</div>;
+                  const subjects = Array.isArray(selectedTeacher.subjects) ? selectedTeacher.subjects.map(String).join('، ') : '';
+                  return (
+                    <form className="teacher-account-card teacher-management-form" onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveTeacherAccount(selectedTeacherAccountId);
+                    }}>
+                      <h2>تعديل بيانات المدرس</h2>
+                      <p className="teacher-account-current-subjects">{subjects ? `المواد المسندة: ${subjects}` : 'لا توجد مواد مسندة لهذا المدرس بعد.'}</p>
+                      <label><span>الاسم الكامل</span><input value={draft.name} onChange={(event) => setTeacherAccountDrafts((current) => ({ ...current, [selectedTeacherAccountId]: { ...draft, name: event.target.value } }))} maxLength={160} autoComplete="name" required /></label>
+                      <label><span>اسم المستخدم</span><input value={draft.username} onChange={(event) => setTeacherAccountDrafts((current) => ({ ...current, [selectedTeacherAccountId]: { ...draft, username: event.target.value } }))} minLength={3} maxLength={80} autoComplete="username" required /></label>
+                      <label><span>كلمة مرور جديدة <small>اتركها فارغة للإبقاء على الحالية</small></span><input type="password" value={draft.password} onChange={(event) => setTeacherAccountDrafts((current) => ({ ...current, [selectedTeacherAccountId]: { ...draft, password: event.target.value } }))} minLength={8} autoComplete="new-password" /></label>
+                      <label className="checkbox-label"><input type="checkbox" checked={draft.isActive} onChange={(event) => setTeacherAccountDrafts((current) => ({ ...current, [selectedTeacherAccountId]: { ...draft, isActive: event.target.checked } }))} /> حساب المدرس فعال</label>
+                      <div className="student-directory-actions">
+                        <button type="submit" className="action-button primary" disabled={savingTeacherAccountId === selectedTeacherAccountId}>{savingTeacherAccountId === selectedTeacherAccountId ? 'جارٍ الحفظ...' : 'حفظ التعديلات'}</button>
+                      </div>
+                    </form>
+                  );
+                })() : (
+                  <div className="loading-box">{teacherAccountRows.length ? 'اختر مدرسًا من القائمة لتعديل بياناته، أو أضف مدرسًا جديدًا.' : 'لا يوجد مدرسون بعد. أضف أول مدرس من الزر أعلاه.'}</div>
+                )}
+              </>
+            )}
+          </section>
+        )}
+
+        {supervisorLoggedIn && selectedFeature === 'teacher_management' && (
+          <section className="admin-dashboard-panel teacher-account-management">
+            <div className="admin-dashboard-heading">
+              <div>
+                <span className="feature-panel-kicker">إدارة أكاديمية</span>
+                <h1>المدرسون والمواد</h1>
+                <p>أضف المدرسين، ثم اربط كل مادة بمدرس والسنة الدراسية المناسبة.</p>
+              </div>
+              <button type="button" className="action-button primary" onClick={() => void refreshAcademicManagement()} disabled={academicManagementLoading}>
+                {academicManagementLoading ? 'جارٍ التحديث...' : 'تحديث القائمة'}
+              </button>
+            </div>
+            <p className="teacher-account-setup-hint">شغّل ملف <code>supabase-academic-management.sql</code> في محرر SQL في Supabase قبل البدء.</p>
+            {academicManagementNotice && <p className={`teacher-account-notice ${academicManagementNoticeType}`} role={academicManagementNoticeType === 'error' ? 'alert' : 'status'}>{academicManagementNotice}</p>}
+            {academicManagementLoading ? <div className="loading-box">جارٍ تحميل البيانات الأكاديمية...</div> : (
+              <>
+                <form className="teacher-account-card teacher-management-form" onSubmit={(event) => void saveAcademicTeacher(event)}>
+                  <h2>{teacherDraft.id ? 'تعديل بيانات المدرس' : 'إضافة مدرس جديد'}</h2>
+                  <label><span>الاسم الكامل للمدرس</span><input value={teacherDraft.name} onChange={(event) => setTeacherDraft((current) => ({ ...current, name: event.target.value }))} maxLength={160} autoComplete="name" placeholder="مثال: أحمد محمد علي" required /></label>
+                  <label><span>اسم المستخدم</span><input value={teacherDraft.username} onChange={(event) => setTeacherDraft((current) => ({ ...current, username: event.target.value }))} minLength={3} maxLength={80} autoComplete="username" placeholder={teacherDraft.id ? 'اتركه فارغًا للإبقاء على الحالي' : '3 محارف على الأقل'} required={!teacherDraft.id} /></label>
+                  <label><span>كلمة المرور {teacherDraft.id && <small>اتركها فارغة للإبقاء على الحالية</small>}</span><input type="password" value={teacherDraft.password} onChange={(event) => setTeacherDraft((current) => ({ ...current, password: event.target.value }))} minLength={8} autoComplete="new-password" placeholder={teacherDraft.id ? 'أدخل كلمة جديدة عند الحاجة' : '8 محارف على الأقل'} required={!teacherDraft.id} /></label>
+                  <label className="checkbox-label"><input type="checkbox" checked={teacherDraft.isActive} onChange={(event) => setTeacherDraft((current) => ({ ...current, isActive: event.target.checked }))} /> حساب المدرس فعال</label>
+                  <div className="student-directory-actions">
+                    <button type="submit" className="action-button primary" disabled={academicManagementSaving}>{academicManagementSaving ? 'جارٍ الحفظ...' : teacherDraft.id ? 'حفظ بيانات المدرس' : 'إنشاء حساب المدرس'}</button>
+                    {teacherDraft.id && <button type="button" className="action-button" onClick={() => setTeacherDraft({ id: '', name: '', username: '', password: '', isActive: true })}>إلغاء التعديل</button>}
+                  </div>
+                </form>
+                <div className="teacher-account-list">
+                  {academicTeachers.map((teacher) => (
+                    <article className="teacher-account-card" key={teacher.id}>
+                      <div className="teacher-account-card-heading">
+                        <strong>{teacher.teacher_name}</strong>
+                        <span>{teacher.is_active ? 'الحساب فعال' : 'الحساب غير فعال'} · اسم المستخدم: {teacher.login_username || 'لم يُعيّن بعد'}</span>
+                      </div>
+                      <div className="student-directory-actions">
+                        <button type="button" className="action-button" onClick={() => setTeacherDraft({ id: teacher.id, name: teacher.teacher_name, username: teacher.login_username ?? '', password: '', isActive: teacher.is_active })}>تعديل الحساب</button>
+                        <button type="button" className="action-button danger" disabled={academicManagementSaving} onClick={() => {
+                          if (window.confirm(`سيؤدي حذف ${teacher.teacher_name} إلى حذف المواد ومواعيد برنامجه. هل تريد المتابعة؟`)) {
+                            void runAcademicAction({ action: 'delete-teacher', id: teacher.id }, 'تم حذف المدرس وارتباطاته.');
+                          }
+                        }}>حذف</button>
+                      </div>
+                    </article>
+                  ))}
+                  {!academicTeachers.length && <div className="loading-box">لم تتم إضافة مدرسين بعد. استخدم النموذج أعلاه لإنشاء أول حساب.</div>}
+                </div>
+
+                <form className="teacher-account-card" onSubmit={(event) => void saveAcademicSubject(event)}>
+                  <h2>{subjectDraft.id ? 'تعديل المادة' : 'إضافة مادة وإسنادها'}</h2>
+                  <label><span>اسم المادة</span><input value={subjectDraft.name} onChange={(event) => setSubjectDraft((current) => ({ ...current, name: event.target.value }))} maxLength={160} required /></label>
+                  <label><span>السنة الدراسية</span>
+                    <select value={subjectDraft.studentYear} onChange={(event) => setSubjectDraft((current) => ({ ...current, studentYear: event.target.value }))}>
+                      {yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+                    </select>
+                  </label>
+                  <label><span>المدرس المسؤول</span>
+                    <select value={subjectDraft.teacherId} onChange={(event) => setSubjectDraft((current) => ({ ...current, teacherId: event.target.value }))} required>
+                      <option value="">اختر المدرس</option>
+                      {academicTeachers.filter((teacher) => teacher.is_active).map((teacher) => <option key={teacher.id} value={teacher.id}>{teacher.teacher_name}</option>)}
+                    </select>
+                  </label>
+                  <div className="student-directory-actions">
+                    <button type="submit" className="action-button primary" disabled={academicManagementSaving || !academicTeachers.length}>{subjectDraft.id ? 'حفظ المادة' : 'إضافة المادة'}</button>
+                    {subjectDraft.id && <button type="button" className="action-button" onClick={() => setSubjectDraft({ id: '', name: '', studentYear: 'أولى', teacherId: '' })}>إلغاء</button>}
+                  </div>
+                </form>
+                <div className="teacher-account-list">
+                  {academicSubjects.map((subject) => {
+                    const assignedTeacher = academicTeachers.find((teacher) => teacher.id === subject.teacher_id);
+                    return (
+                      <article className="teacher-account-card" key={subject.id}>
+                        <div className="teacher-account-card-heading"><strong>{subject.name}</strong><span>{subject.student_year} · {assignedTeacher?.teacher_name ?? 'مدرس غير محدد'}</span></div>
+                        <div className="student-directory-actions">
+                          <button type="button" className="action-button" onClick={() => setSubjectDraft({ id: subject.id, name: subject.name, studentYear: subject.student_year, teacherId: subject.teacher_id })}>تعديل</button>
+                          <button type="button" className="action-button danger" disabled={academicManagementSaving} onClick={() => {
+                            if (window.confirm(`هل تريد حذف المادة ${subject.name}؟`)) {
+                              void runAcademicAction({ action: 'delete-subject', id: subject.id }, 'تم حذف المادة وإسنادها.');
+                            }
+                          }}>حذف</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </section>
+        )}
+
+        {supervisorLoggedIn && selectedFeature === 'class_schedule' && (
+          <section className="admin-dashboard-panel teacher-account-management">
+            <div className="admin-dashboard-heading">
+              <div>
+                <span className="feature-panel-kicker">إدارة أكاديمية</span>
+                <h1>الفئات وبرنامج الدوام</h1>
+                <p>تظهر الفئات ومواعيد البرنامج للطلاب الذين تنتمي سجلاتهم إلى السنة الدراسية نفسها فقط.</p>
+              </div>
+              <button type="button" className="action-button primary" onClick={() => void refreshAcademicManagement()} disabled={academicManagementLoading}>
+                {academicManagementLoading ? 'جارٍ التحديث...' : 'تحديث القائمة'}
+              </button>
+            </div>
+            {academicManagementNotice && <p className={`teacher-account-notice ${academicManagementNoticeType}`} role={academicManagementNoticeType === 'error' ? 'alert' : 'status'}>{academicManagementNotice}</p>}
+            {academicManagementLoading ? <div className="loading-box">جارٍ تحميل الفئات والبرنامج...</div> : (
+              <>
+                <form className="teacher-account-card" onSubmit={(event) => void saveAcademicClass(event)}>
+                  <h2>{classDraft.id ? 'تعديل الفئة' : 'إضافة فئة'}</h2>
+                  <label><span>اسم الفئة</span><input value={classDraft.name} onChange={(event) => setClassDraft((current) => ({ ...current, name: event.target.value }))} maxLength={80} required /></label>
+                  <label><span>السنة الدراسية</span>
+                    <select value={classDraft.studentYear} onChange={(event) => setClassDraft((current) => ({ ...current, studentYear: event.target.value }))}>
+                      {yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+                    </select>
+                  </label>
+                  <label><span>السعة القصوى <small>اتركها فارغة إذا لم توجد سعة محددة</small></span><input type="number" min="0" value={classDraft.capacity} onChange={(event) => setClassDraft((current) => ({ ...current, capacity: event.target.value }))} /></label>
+                  <div className="student-directory-actions">
+                    <button type="submit" className="action-button primary" disabled={academicManagementSaving}>{classDraft.id ? 'حفظ الفئة' : 'إضافة الفئة'}</button>
+                    {classDraft.id && <button type="button" className="action-button" onClick={() => setClassDraft({ id: '', name: '', studentYear: 'أولى', capacity: '' })}>إلغاء</button>}
+                  </div>
+                </form>
+                <div className="teacher-account-list">
+                  {academicClasses.map((academicClass) => (
+                    <article className="teacher-account-card" key={academicClass.id}>
+                      <div className="teacher-account-card-heading"><strong>{academicClass.name}</strong><span>{academicClass.student_year} · السعة: {academicClass.capacity ?? 'غير محددة'}</span></div>
+                      <div className="student-directory-actions">
+                        <button type="button" className="action-button" onClick={() => setClassDraft({ id: academicClass.id, name: academicClass.name, studentYear: academicClass.student_year, capacity: academicClass.capacity === null ? '' : String(academicClass.capacity) })}>تعديل</button>
+                        <button type="button" className="action-button danger" disabled={academicManagementSaving} onClick={() => {
+                          if (window.confirm(`هل تريد حذف الفئة ${academicClass.name}؟`)) {
+                            void runAcademicAction({ action: 'delete-class', id: academicClass.id }, 'تم حذف الفئة.');
+                          }
+                        }}>حذف</button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+
+                <form className="teacher-account-card" onSubmit={(event) => void saveAcademicSchedule(event)}>
+                  <h2>{scheduleDraft.id ? 'تعديل موعد البرنامج' : 'إضافة موعد للبرنامج'}</h2>
+                  <label><span>السنة الدراسية</span>
+                    <select value={scheduleDraft.studentYear} onChange={(event) => setScheduleDraft((current) => ({ ...current, studentYear: event.target.value, subject: '', teacherId: '' }))} required>
+                      <option value="">اختر السنة</option>
+                      {yearOptions.map((year) => <option key={year} value={year}>{year}</option>)}
+                    </select>
+                  </label>
+                  <label><span>المادة والمدرس</span>
+                    <select value={scheduleDraft.subject} onChange={(event) => {
+                      const assignment = academicSubjects.find((item) => item.student_year === scheduleDraft.studentYear && item.name === event.target.value);
+                      setScheduleDraft((current) => ({ ...current, subject: event.target.value, teacherId: assignment?.teacher_id ?? '' }));
+                    }} required>
+                      <option value="">اختر مادة مسندة</option>
+                      {academicSubjects.filter((item) => item.student_year === scheduleDraft.studentYear).map((item) => (
+                        <option key={item.id} value={item.name}>{item.name} — {academicTeachers.find((teacher) => teacher.id === item.teacher_id)?.teacher_name ?? 'مدرس'}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label><span>اليوم</span><select value={scheduleDraft.day} onChange={(event) => setScheduleDraft((current) => ({ ...current, day: event.target.value }))}>{scheduleDayOptions.map((day) => <option key={day} value={day}>{day}</option>)}</select></label>
+                  <div className="student-directory-actions">
+                    <label><span>من</span><input type="time" value={scheduleDraft.startTime} onChange={(event) => setScheduleDraft((current) => ({ ...current, startTime: event.target.value }))} required /></label>
+                    <label><span>إلى</span><input type="time" value={scheduleDraft.endTime} onChange={(event) => setScheduleDraft((current) => ({ ...current, endTime: event.target.value }))} required /></label>
+                  </div>
+                  <label><span>الفئة <small>اتركها فارغة لتكون الحصة لكل الفئات في السنة</small></span>
+                    <select value={scheduleDraft.groupName} onChange={(event) => setScheduleDraft((current) => ({ ...current, groupName: event.target.value }))}>
+                      <option value="">كل الفئات</option>
+                      {academicClasses.filter((item) => item.student_year === scheduleDraft.studentYear).map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}
+                    </select>
+                  </label>
+                  <label><span>نوع الحصة</span><input value={scheduleDraft.type} onChange={(event) => setScheduleDraft((current) => ({ ...current, type: event.target.value }))} maxLength={80} /></label>
+                  <label><span>القاعة</span><input value={scheduleDraft.location} onChange={(event) => setScheduleDraft((current) => ({ ...current, location: event.target.value }))} maxLength={160} /></label>
+                  <div className="student-directory-actions">
+                    <button type="submit" className="action-button primary" disabled={academicManagementSaving || !academicSubjects.some((item) => item.student_year === scheduleDraft.studentYear)}>{scheduleDraft.id ? 'حفظ الموعد' : 'إضافة الموعد'}</button>
+                    {scheduleDraft.id && <button type="button" className="action-button" onClick={() => setScheduleDraft((current) => ({ ...current, id: '', startTime: '', endTime: '', location: '', groupName: '' }))}>إلغاء</button>}
+                  </div>
+                </form>
+                <div className="teacher-account-list">
+                  {academicSchedule.map((item) => (
+                    <article className="teacher-account-card" key={item.id}>
+                      <div className="teacher-account-card-heading"><strong>{item.subject} · {item.student_year || 'سنة غير محددة'}</strong><span>{item.day} · {item.start_time}–{item.end_time} · {item.group_name || 'كل الفئات'} · {item.location || 'دون قاعة'}</span></div>
+                      <div className="student-directory-actions">
+                        <button type="button" className="action-button" onClick={() => setScheduleDraft({
+                          id: item.id,
+                          studentYear: item.student_year ?? '',
+                          subject: item.subject,
+                          teacherId: item.teacher_id ?? '',
+                          day: item.day,
+                          startTime: item.start_time,
+                          endTime: item.end_time,
+                          type: item.type || 'محاضرة',
+                          location: item.location || '',
+                          groupName: item.group_name || '',
+                        })}>تعديل</button>
+                        <button type="button" className="action-button danger" disabled={academicManagementSaving} onClick={() => {
+                          if (window.confirm(`هل تريد حذف موعد ${item.subject}؟`)) {
+                            void runAcademicAction({ action: 'delete-schedule', id: item.id }, 'تم حذف الموعد.');
+                          }
+                        }}>حذف</button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </>
+            )}
           </section>
         )}
 
@@ -2835,7 +3687,7 @@ export default function AttendancePage() {
               <input value={newStudentForm['الكنية'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'الكنية': event.target.value })} placeholder="الكنية" required />
               <select value={newStudentForm['الفئة'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'الفئة': event.target.value })} required={supervisorDegree !== '2'}>
                 <option value="">{supervisorDegree === '2' ? 'بدون فئة (اختياري)' : 'اختر الفئة'}</option>
-                {allowedStudentClasses.map((className) => <option key={className} value={className}>{className}</option>)}
+                {getClassOptionsForYear(academicClasses, academicManagementLoaded, newStudentForm['السنه الدراسية'] ?? '').map((className) => <option key={className} value={className}>{className}</option>)}
               </select>
               <select value={newStudentForm['السنه الدراسية'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'السنه الدراسية': event.target.value })} required>
                 <option value="">اختر السنة</option>
@@ -2921,7 +3773,7 @@ export default function AttendancePage() {
                 <input value={newStudentForm['الكنية'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'الكنية': event.target.value })} placeholder="الكنية" required />
                 <select value={newStudentForm['الفئة'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'الفئة': event.target.value })} required={supervisorDegree !== '2'}>
                   <option value="">{supervisorDegree === '2' ? 'بدون فئة (اختياري)' : 'اختر الفئة'}</option>
-                  {allowedStudentClasses.map((className) => <option key={className} value={className}>{className}</option>)}
+                  {getClassOptionsForYear(academicClasses, academicManagementLoaded, newStudentForm['السنه الدراسية'] ?? '').map((className) => <option key={className} value={className}>{className}</option>)}
                 </select>
                 <select value={newStudentForm['السنه الدراسية'] ?? ''} onChange={(event) => setNewStudentForm({ ...newStudentForm, 'السنه الدراسية': event.target.value })} required>
                   <option value="">اختر السنة</option>
@@ -3007,7 +3859,7 @@ export default function AttendancePage() {
                 <input value={editingStudentDraft['القسم'] ?? defaultStudentSection} onChange={(event) => setEditingStudentDraft({ ...editingStudentDraft, 'القسم': event.target.value })} placeholder="القسم" readOnly />
                 <select value={editingStudentDraft['الفئة'] ?? ''} onChange={(event) => setEditingStudentDraft({ ...editingStudentDraft, 'الفئة': event.target.value })}>
                   <option value="">بدون فئة</option>
-                  {allowedStudentClasses.map((className) => <option key={className} value={className}>{className}</option>)}
+                  {getClassOptionsForYear(academicClasses, academicManagementLoaded, editingStudentDraft['السنه الدراسية'] ?? '').map((className) => <option key={className} value={className}>{className}</option>)}
                 </select>
                 <select value={editingStudentDraft['السنه الدراسية'] ?? ''} onChange={(event) => setEditingStudentDraft({ ...editingStudentDraft, 'السنه الدراسية': event.target.value })} required>
                   <option value="">اختر السنة</option>
@@ -3134,10 +3986,99 @@ export default function AttendancePage() {
         )}
 
         {supervisorLoggedIn && selectedFeature === 'logs' && (
-          <section className="admin-dashboard-panel">
-            <div className="admin-dashboard-heading"><div><span className="feature-panel-kicker">المتابعة والتدقيق</span><h1>سجلات الطلاب والمشرفين</h1><p>كل عملية مسجلة مع المستخدم والجهاز والتاريخ والوقت.</p></div><button type="button" className="action-button primary" onClick={() => void refreshAuditLogs()}>تحديث السجلات</button></div>
-            <div className="admin-record-list">{auditLogs.map((log, index) => <div className="admin-record-item" key={`${getAdminRecordValue(log, ['log_id'])}-${index}`}><strong>{String(getAdminRecordValue(log, ['action']) || 'عملية')}</strong><span>المستخدم: {String(getAdminRecordValue(log, ['username']) || 'غير محدد')}</span><span>النوع: {String(getAdminRecordValue(log, ['user_type']) || '')}</span><span>{String(getAdminRecordValue(log, ['created_at']) || '')}</span><span>الجهاز: {String(getAdminRecordValue(log, ['device_type']) || '')} / {String(getAdminRecordValue(log, ['platform']) || '')}</span><span>المسار: {String(getAdminRecordValue(log, ['path']) || '')}</span></div>)}</div>
-            {auditLogs.length === 0 && <div className="loading-box">لا توجد سجلات أو لم يتم إنشاء جدول سجلات النظام بعد.</div>}
+          <section className="admin-dashboard-panel audit-log-panel">
+            <div className="admin-dashboard-heading">
+              <div>
+                <span className="feature-panel-kicker">المتابعة والتدقيق</span>
+                <h1>سجلات النظام</h1>
+                <p>سجلات الطلاب والمدرسين والمشرفين مع بيانات العملية والجهاز وعنوان الشبكة.</p>
+              </div>
+              <button type="button" className="action-button primary" onClick={() => void refreshAuditLogs()} disabled={adminLoading}>تحديث السجلات</button>
+            </div>
+            <div className="audit-log-filters">
+              <label>
+                <span>بحث بالاسم أو الرقم أو عنوان IP</span>
+                <input value={auditLogSearch} onChange={(event) => setAuditLogSearch(event.target.value)} placeholder="ابحث في المستخدمين والعمليات..." />
+              </label>
+              <label>
+                <span>نوع المستخدم</span>
+                <select value={auditLogUserType} onChange={(event) => setAuditLogUserType(event.target.value)}>
+                  <option value="all">كل المستخدمين</option>
+                  <option value="student">الطلاب</option>
+                  <option value="teacher">المدرسون</option>
+                  <option value="supervisor">المشرفون</option>
+                </select>
+              </label>
+              <label>
+                <span>نوع العملية</span>
+                <select value={auditLogActionType} onChange={(event) => setAuditLogActionType(event.target.value)}>
+                  <option value="all">كل العمليات</option>
+                  <option value="authentication">دخول وخروج</option>
+                  <option value="password">تغيير كلمة المرور</option>
+                  <option value="class">تغيير الفئة</option>
+                  <option value="attendance">الحضور والإنذارات</option>
+                  <option value="management">إدارة المدرسين والمواد والفئات</option>
+                  <option value="accounts">إدارة حسابات الطلاب</option>
+                  <option value="other">عمليات أخرى</option>
+                </select>
+              </label>
+              <strong className="audit-log-result-count">النتائج: {filteredAuditLogs.length}</strong>
+            </div>
+            <div className="audit-log-table-wrap">
+              <table className="audit-log-table">
+                <thead>
+                  <tr>
+                    <th>التاريخ والوقت</th>
+                    <th>المستخدم</th>
+                    <th>النوع</th>
+                    <th>العملية</th>
+                    <th>التفاصيل</th>
+                    <th>عنوان IP</th>
+                    <th>الجهاز والمتصفح</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredAuditLogs.map((log, index) => {
+                    const action = String(getAdminRecordValue(log, ['action']) || 'عملية');
+                    const userType = String(getAdminRecordValue(log, ['user_type']) || '');
+                    const details = getAdminRecordValue(log, ['details']);
+                    const detailText = typeof details === 'string' ? details : JSON.stringify(details ?? {}, null, 2);
+                    const deviceType = String(getAdminRecordValue(log, ['device_type']) || '');
+                    const platform = String(getAdminRecordValue(log, ['platform']) || '');
+                    const userAgent = String(getAdminRecordValue(log, ['user_agent']) || '');
+                    const createdAt = String(getAdminRecordValue(log, ['created_at']) || '');
+                    const parsedCreatedAt = new Date(createdAt);
+                    return (
+                      <tr key={`${getAdminRecordValue(log, ['log_id'])}-${index}`}>
+                        <td>{createdAt && !Number.isNaN(parsedCreatedAt.getTime()) ? parsedCreatedAt.toLocaleString('ar-SY') : createdAt || '—'}</td>
+                        <td>
+                          <strong>{String(getAdminRecordValue(log, ['full_name']) || getAdminRecordValue(log, ['username']) || 'غير محدد')}</strong>
+                          <small>{String(getAdminRecordValue(log, ['username']) || '')}{getAdminRecordValue(log, ['user_id']) ? ` · ${String(getAdminRecordValue(log, ['user_id']))}` : ''}</small>
+                        </td>
+                        <td><span className={`audit-log-user-type ${userType}`}>{auditUserTypeLabels[userType] || userType || 'غير محدد'}</span></td>
+                        <td>{getAuditActionLabel(action)}</td>
+                        <td>
+                          <details className="audit-log-details">
+                            <summary>عرض التفاصيل</summary>
+                            <pre>{detailText}</pre>
+                            <small>المسار: {String(getAdminRecordValue(log, ['path']) || '—')}</small>
+                          </details>
+                        </td>
+                        <td dir="ltr">{String(getAdminRecordValue(log, ['ip_address']) || 'غير متوفر')}</td>
+                        <td>
+                          <strong>{deviceType === 'mobile' ? 'جوال' : deviceType === 'desktop' ? 'كمبيوتر' : deviceType || 'غير معروف'}</strong>
+                          <small>{platform || 'منصة غير محددة'}</small>
+                          <small>{userAgent}</small>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {!filteredAuditLogs.length && (
+                    <tr><td colSpan={7} className="audit-log-empty">لا توجد سجلات مطابقة. تأكد من تشغيل ملف supabase-audit-log.sql.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </section>
         )}
 
@@ -3169,7 +4110,9 @@ export default function AttendancePage() {
               <label htmlFor="course-select">اختر المادة</label>
               <select id="course-select" value={selectedCourse} onChange={(e) => setSelectedCourse(e.target.value)}>
                 <option value="">-- اختر المادة --</option>
-                {courseOptions.map((course) => (
+                {(academicManagementLoaded
+                  ? academicSubjects.filter((item) => item.student_year === selectedYear).map((item) => item.name)
+                  : courseOptions).map((course) => (
                   <option value={course} key={course}>{course}</option>
                 ))}
               </select>
@@ -3177,7 +4120,16 @@ export default function AttendancePage() {
 
             <div className="field-group">
               <label htmlFor="year-select">السنة الدراسية</label>
-              <select id="year-select" value={selectedYear} onChange={(e) => setSelectedYear(e.target.value)}>
+              <select id="year-select" value={selectedYear} onChange={(e) => {
+                const nextYear = e.target.value;
+                setSelectedYear(nextYear);
+                if (academicManagementLoaded) {
+                  const nextCourse = academicSubjects.find((item) => item.student_year === nextYear)?.name ?? '';
+                  const nextClass = getClassOptionsForYear(academicClasses, true, nextYear)[0] ?? '';
+                  setSelectedCourse(nextCourse);
+                  setSelectedClass(nextClass);
+                }
+              }}>
                 {yearOptions.map((year) => (
                   <option value={year} key={year}>سنة {year}</option>
                 ))}
@@ -3188,7 +4140,7 @@ export default function AttendancePage() {
               <label htmlFor="class-select">اختر الفئة</label>
               <select id="class-select" value={selectedClass} onChange={(e) => setSelectedClass(e.target.value)}>
                 <option value="">-- اختر الفئة --</option>
-                {classOptions.map((className) => (
+                {getClassOptionsForYear(academicClasses, academicManagementLoaded, selectedYear).map((className) => (
                   <option value={className} key={className}>فئة {className}</option>
                 ))}
               </select>

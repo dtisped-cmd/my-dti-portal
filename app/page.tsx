@@ -2,15 +2,16 @@
 
 import Link from 'next/link';
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
-import { Code2, Download, Pencil } from 'lucide-react';
+import { Code2, Download, Pencil, Settings, X } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { writeAuditLog } from '../lib/auditLog';
 import { teacherEvaluationsTemporarilyDisabled } from '../lib/featureFlags';
 import {
-  getClassAvailabilityOptions,
   getStudentById,
+  getTeacherAlertsForStudent,
   getWarningsForStudent,
   getRecordValue,
+  normalizeStudentYear,
   normalizeText,
   StudentRow,
 } from '../lib/studentData';
@@ -240,6 +241,7 @@ export default function Home() {
   const [loggedStudent, setLoggedStudent] = useState<StudentRow | null>(null);
   const [grades, setGrades] = useState<GradeEntry[]>([]);
   const [warnings, setWarnings] = useState<Record<string, unknown>[]>([]);
+  const [teacherAlertLoadError, setTeacherAlertLoadError] = useState('');
   const [scheduleItems, setScheduleItems] = useState<ScheduleItem[]>([]);
   const [studentSkills, setStudentSkills] = useState<StudentSkill[]>([]);
   const [skillDrafts, setSkillDrafts] = useState<StudentSkill[]>([]);
@@ -261,6 +263,10 @@ export default function Home() {
   const studentDashboardRef = useRef<HTMLDivElement>(null);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [showAccountModal, setShowAccountModal] = useState(false);
+  const [accountDraft, setAccountDraft] = useState({ email: '', phone: '', password: '' });
+  const [accountModalNotice, setAccountModalNotice] = useState('');
+  const [isSavingAccount, setIsSavingAccount] = useState(false);
   const [isExportingQr, setIsExportingQr] = useState(false);
   const [qrExportError, setQrExportError] = useState('');
   const [studentStatus, setStudentStatus] = useState<string>('غير متوفر');
@@ -629,6 +635,14 @@ export default function Home() {
 
         setLoggedStudent(hydratedStudent);
         setTelegramNotificationsEnabled(enabled);
+        writeAuditLog({
+          action: 'student_telegram_preference_updated',
+          userType: 'student',
+          userId: studentId,
+          username: studentFullName,
+          fullName: studentFullName,
+          details: { enabled, chatIdUpdated: nextChatId !== undefined },
+        });
       }
     } catch {
       // Ignore DB column mismatch; keep local UI state for active session.
@@ -645,6 +659,14 @@ export default function Home() {
         if (!error) {
           setTelegramNotificationsEnabled(false);
           setLoggedStudent((previous) => (previous ? { ...previous, telegram_notifications_enabled: false } : previous));
+          writeAuditLog({
+            action: 'student_telegram_preference_updated',
+            userType: 'student',
+            userId: studentId,
+            username: studentFullName,
+            fullName: studentFullName,
+            details: { enabled: false },
+          });
         }
       } catch {
         setTelegramNotificationsEnabled(false);
@@ -694,6 +716,14 @@ export default function Home() {
         setShowTelegramSettingsModal(false);
         setTelegramChatIdInput('');
         setToast({ message: 'تم تفعيل التنبيهات وحفظ معرف التلجرام', type: 'success' });
+        writeAuditLog({
+          action: 'student_telegram_linked',
+          userType: 'student',
+          userId: studentId,
+          username: studentFullName,
+          fullName: studentFullName,
+          details: { notificationsEnabled: true },
+        });
       } else {
         setToast({ message: 'تعذر حفظ معرف التلجرام', type: 'error' });
       }
@@ -704,8 +734,22 @@ export default function Home() {
 
   const refreshClassOptions = async () => {
     try {
-      const results = await getClassAvailabilityOptions();
-      const normalized = results.map((item) => ({
+      const studentYear = normalizeStudentYear(getRecordValue(loggedStudent as Record<string, unknown>, ['السنه الدراسية', 'السنة الدراسية', 'year', 'student_year']));
+      if (!studentYear) {
+        setClassOptions([]);
+        return;
+      }
+      const response = await fetch('/api/student/classes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentId: String(loggedStudent?.['الرقم الجامعي'] ?? ''),
+          password: String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? ''),
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string; classes?: Array<{ name: string; capacity: number | null; occupied: number; available: number | null }> };
+      if (!response.ok || !result.success) throw new Error(result.error || 'student-classes-load-failed');
+      const normalized = (result.classes ?? []).map((item) => ({
         ...item,
         name: String(item.name || '').trim() || 'غير محدد',
         available: item.available !== null ? Math.max(item.available, 0) : null,
@@ -721,8 +765,9 @@ export default function Home() {
           setSelectedClassForUpdate(currentClass);
         }
       }
-    } catch {
+    } catch (error) {
       setClassOptions([]);
+      setToast({ message: error instanceof Error ? 'تعذر تحميل فئات السنة الدراسية للطالب.' : 'تعذر تحميل الفئات.', type: 'error' });
     }
   };
 
@@ -792,11 +837,34 @@ export default function Home() {
     if (!loggedStudent || !loggedStudent['الرقم الجامعي']) return;
 
     const studentId = String(loggedStudent['الرقم الجامعي']);
+    const studentYear = normalizeStudentYear(getRecordValue(loggedStudent as Record<string, unknown>, ['السنه الدراسية', 'السنة الدراسية', 'year', 'student_year']));
 
     try {
-      const [studentResult, warningsResult, gradesResult, scheduleResult, skillsResult] = await Promise.all([
+      const scheduleQuery = hasStudentGroup && studentYear
+        ? fetch('/api/student/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            studentId,
+            password: String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? ''),
+          }),
+        }).then(async (response) => {
+          const result = await response.json() as { success?: boolean; error?: string; schedule?: unknown[] };
+          if (!response.ok || !result.success) throw new Error(result.error || 'student-schedule-load-failed');
+          return { data: result.schedule ?? [], error: null };
+        }).catch((error: unknown) => ({
+          data: [],
+          error: error instanceof Error ? error : new Error(String(error)),
+        }))
+        : Promise.resolve({ data: [], error: null });
+      const [studentResult, warningsResult, teacherAlertsResult, gradesResult, scheduleResult, skillsResult] = await Promise.all([
         getStudentById(studentId),
         getWarningsForStudent(studentId).then((rows) => ({ data: rows })),
+        getTeacherAlertsForStudent(
+          studentId,
+          String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? '')
+        ).then((rows) => ({ data: rows, error: null as Error | null }))
+          .catch((error: unknown) => ({ data: [] as Record<string, unknown>[], error: error instanceof Error ? error : new Error(String(error)) })),
         getTableRows(['الاعمال', 'الأعمال', 'أعمال', 'العملي', 'النظري']).then(({ data }) => ({
           data: Array.isArray(data) ? data.filter((row) => {
             const rowRecord = row as unknown as Record<string, unknown>;
@@ -804,9 +872,7 @@ export default function Home() {
             return String(rowStudentId ?? '') === String(studentId);
           }) : [],
         })),
-        hasStudentGroup
-          ? supabase.from('schedule_items').select('id, day, start_time, end_time, subject, type, location, group_name')
-          : Promise.resolve({ data: [], error: null }),
+        scheduleQuery,
         supabase.from('student_skills').select('skills').eq('student_id', studentId).maybeSingle(),
       ]);
 
@@ -817,7 +883,9 @@ export default function Home() {
 
       const gradeRows = gradesResult.data.flatMap((row) => extractGrades([row as unknown as Record<string, unknown>]));
       setGrades(gradeRows);
-      setWarnings(warningsResult.data as unknown as Record<string, unknown>[]);
+      setWarnings([...(warningsResult.data as unknown as Record<string, unknown>[]), ...teacherAlertsResult.data]
+        .sort((first, second) => String(second['التاريخ'] ?? '').localeCompare(String(first['التاريخ'] ?? ''))));
+      setTeacherAlertLoadError(teacherAlertsResult.error?.message ?? '');
       if (!skillsResult.error) {
         const storedSkills = (skillsResult.data as { skills?: unknown } | null)?.skills;
         const normalizedSkills = Array.isArray(storedSkills)
@@ -838,14 +906,16 @@ export default function Home() {
         const matchingSchedule = (Array.isArray(scheduleResult.data) ? scheduleResult.data : [])
           .filter((item) => {
             const scheduleItem = item as Record<string, unknown>;
-            const itemGroup = String(scheduleItem.group_name ?? '').trim();
-            return !itemGroup || itemGroup === currentGroup;
+            const itemGroup = String(scheduleItem.group_name ?? '').trim().replace(/^فئة\s*/i, '');
+            return normalizeStudentYear(scheduleItem.student_year) === studentYear
+              && (!itemGroup || itemGroup === currentGroup);
           })
           .map((item) => item as ScheduleItem)
           .sort((first, second) => `${scheduleDays.indexOf(first.day)}-${first.start_time}`.localeCompare(`${scheduleDays.indexOf(second.day)}-${second.start_time}`));
         setScheduleItems(matchingSchedule);
       } else {
         setScheduleItems([]);
+        setToast({ message: 'تعذر تحميل برنامج السنة الدراسية.', type: 'error' });
       }
       if (!currentGroup && activeTab === 'schedule') setActiveTab('record');
       const statusData = (freshStudent as Record<string, unknown> | null) ?? {};
@@ -909,6 +979,14 @@ export default function Home() {
     setIsEditingSkills(false);
     setSkillsMessage('');
     setToast({ message: 'تم حفظ مهاراتك بنجاح', type: 'success' });
+    writeAuditLog({
+      action: 'student_skills_updated',
+      userType: 'student',
+      userId: studentId,
+      username: studentFullName,
+      fullName: studentFullName,
+      details: { skillCount: skillDrafts.length },
+    });
   };
 
   const compressStudentAvatar = async (file: File) => {
@@ -1007,6 +1085,13 @@ export default function Home() {
       }
 
       setLoggedStudent((current) => current ? { ...current, avatar_url: avatarUrl } : current);
+      writeAuditLog({
+        action: 'student_avatar_updated',
+        userType: 'student',
+        userId: studentId,
+        username: studentFullName,
+        fullName: studentFullName,
+      });
       setAvatarNotice({ message: 'تم تحديث الصورة الشخصية بنجاح.', type: 'success' });
     } catch (error) {
       if (uploadedPath) await supabase.storage.from('avatars').remove([uploadedPath]);
@@ -1016,6 +1101,83 @@ export default function Home() {
       });
     } finally {
       setIsUploadingAvatar(false);
+    }
+  };
+
+  const openAccountModal = () => {
+    const studentRecord = (loggedStudent ?? {}) as Record<string, unknown>;
+    setAccountDraft({
+      email: String(getRecordValue(studentRecord, ['البريد الإلكتروني', 'email']) ?? ''),
+      phone: String(getRecordValue(studentRecord, ['رقم الهاتف', 'phone']) ?? ''),
+      password: '',
+    });
+    setAccountModalNotice('');
+    setAvatarNotice(null);
+    setShowAccountModal(true);
+  };
+
+  const saveAccountChanges = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+    const email = accountDraft.email.trim();
+    const phone = accountDraft.phone.trim();
+    const password = accountDraft.password;
+    if (!studentId) return;
+    if (password && password.length < 8) {
+      setAccountModalNotice('يجب أن تتكون كلمة المرور من 8 محارف على الأقل.');
+      return;
+    }
+
+    setIsSavingAccount(true);
+    setAccountModalNotice('');
+    try {
+      const studentRecord = loggedStudent as Record<string, unknown>;
+      const updatePayload: Record<string, string> = {
+      };
+      const emailColumns = ['البريد الإلكتروني', 'email'].filter((column) => Object.prototype.hasOwnProperty.call(studentRecord, column));
+      const phoneColumns = ['رقم الهاتف', 'phone'].filter((column) => Object.prototype.hasOwnProperty.call(studentRecord, column));
+      (emailColumns.length ? emailColumns : ['البريد الإلكتروني']).forEach((column) => { updatePayload[column] = email; });
+      (phoneColumns.length ? phoneColumns : ['رقم الهاتف']).forEach((column) => { updatePayload[column] = phone; });
+      if (password) {
+        const passwordColumns = ['كلمة السر', 'password'].filter((column) => Object.prototype.hasOwnProperty.call(studentRecord, column));
+        (passwordColumns.length ? passwordColumns : ['كلمة السر']).forEach((column) => { updatePayload[column] = password; });
+      }
+
+      const { data: updatedStudent, error } = await supabase
+        .from('students')
+        .update(updatePayload)
+        .eq('الرقم الجامعي', studentId)
+        .select('*')
+        .maybeSingle();
+      if (error) throw error;
+      if (!updatedStudent) throw new Error('لم يتم العثور على سجل الطالب لتحديثه.');
+
+      const updatedRecord = updatedStudent as StudentRow;
+      setLoggedStudent((current) => current ? { ...current, ...updatedRecord } : current);
+      if (password) {
+        setLoginData((current) => ({ ...current, password }));
+        if (rememberStudentId) {
+          window.localStorage.setItem(rememberedStudentPasswordStorageKey, password);
+        }
+      }
+      setAccountDraft((current) => ({ ...current, password: '' }));
+      setShowAccountModal(false);
+      setToast({ message: 'تم تحديث بيانات الحساب بنجاح.', type: 'success' });
+      writeAuditLog({
+        action: 'student_account_updated',
+        userType: 'student',
+        userId: studentId,
+        username: studentFullName,
+        details: {
+          emailChanged: email !== String(getRecordValue(studentRecord, ['البريد الإلكتروني', 'email']) ?? '').trim(),
+          phoneChanged: phone !== String(getRecordValue(studentRecord, ['رقم الهاتف', 'phone']) ?? '').trim(),
+          passwordChanged: Boolean(password),
+        },
+      });
+    } catch (error) {
+      setAccountModalNotice(error instanceof Error ? error.message : 'حدث خطأ أثناء تحديث بيانات الحساب.');
+    } finally {
+      setIsSavingAccount(false);
     }
   };
 
@@ -1253,11 +1415,17 @@ export default function Home() {
         window.localStorage.removeItem(rememberedStudentIdStorageKey);
         window.localStorage.removeItem(rememberedStudentPasswordStorageKey);
       }
+      const authenticatedStudentFullName = [
+        getRecordValue(user as Record<string, unknown>, ['اسم الطالب', 'name', 'student_name']),
+        getRecordValue(user as Record<string, unknown>, ['اسم الاب', 'اسم الأب', 'father_name']),
+        getRecordValue(user as Record<string, unknown>, ['الكنية', 'family_name', 'surname']),
+      ].map((part) => String(part ?? '').trim()).filter(Boolean).join(' ');
       writeAuditLog({
         action: 'student_login',
         userType: 'student',
         userId: studentId,
-        username: String(getRecordValue(user as Record<string, unknown>, ['اسم الطالب', 'student_name', 'name']) ?? ''),
+        username: authenticatedStudentFullName,
+        fullName: authenticatedStudentFullName,
       });
       const studentName = normalizeText(getRecordValue(user as Record<string, unknown>, ['اسم الطالب', 'student_name', 'name']));
       setNotice(`تم تسجيل الدخول بنجاح، مرحباً ${studentName}`);
@@ -1374,13 +1542,21 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           studentId: String(loggedStudent?.['الرقم الجامعي'] ?? ''),
+          password: String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? ''),
           nextClass,
         }),
       });
       const result = await response.json() as { success?: boolean; error?: string; emailSent?: boolean; telegramSent?: boolean };
       if (!result.success) {
-        setNotice(result.error === 'class-full' ? 'لا يمكن الانتقال إلى هذه الفئة لأن المقاعد ممتلئة' : 'تعذر تغيير الفئة');
-        setToast({ message: result.error === 'class-full' ? 'لا توجد مقاعد متاحة في هذه الفئة' : 'تعذر تغيير الفئة', type: 'error' });
+        const changeErrors: Record<string, string> = {
+          'class-full': 'لا توجد مقاعد متاحة في هذه الفئة.',
+          'student-year-missing': 'لا يمكن تغيير الفئة قبل تحديد السنة الدراسية في بيانات الطالب.',
+          'class-not-available-for-student-year': 'هذه الفئة غير متاحة لسنتك الدراسية.',
+          'student-portal-server-key-missing': 'خدمة تغيير الفئة غير مهيأة على الخادم.',
+        };
+        const message = changeErrors[result.error ?? ''] ?? 'تعذر تغيير الفئة.';
+        setNotice(message);
+        setToast({ message, type: 'error' });
         return;
       }
 
@@ -1405,7 +1581,8 @@ export default function Home() {
         action: 'student_class_changed',
         userType: 'student',
         userId: loggedStudent?.['الرقم الجامعي'],
-        username: String(loggedStudent?.['اسم الطالب'] ?? ''),
+        username: studentFullName,
+        fullName: studentFullName,
         details: { previousClass: currentClass, nextClass },
       });
     } catch {
@@ -1456,7 +1633,8 @@ export default function Home() {
         action: 'student_id_changed',
         userType: 'student',
         userId: result.studentId ?? nextStudentId,
-        username: String(loggedStudent?.['اسم الطالب'] ?? ''),
+        username: studentFullName,
+        fullName: studentFullName,
         details: { previousStudentId: currentStudentId, nextStudentId: result.studentId ?? nextStudentId },
       });
     } catch {
@@ -1471,7 +1649,8 @@ export default function Home() {
       action: 'student_logout',
       userType: 'student',
       userId: loggedStudent?.['الرقم الجامعي'],
-      username: String(loggedStudent?.['اسم الطالب'] ?? ''),
+      username: studentFullName,
+      fullName: studentFullName,
     });
     window.localStorage.removeItem(studentSessionStorageKey);
     setIsLoggedIn(false);
@@ -1664,7 +1843,7 @@ export default function Home() {
         </div>
 
         <div className="login-footer">
-          <Link href="/attendance/" className="admin-link">
+          <Link href="/dashboard" className="admin-link">
             لوحة التحكم للمشرفين
           </Link>
         </div>
@@ -1723,7 +1902,13 @@ export default function Home() {
               </label>
             </div>
             <div className="student-avatar-controls">
-              <strong className="student-avatar-name">{studentFullName}</strong>
+              <div className="student-avatar-name-row">
+                <strong className="student-avatar-name">{studentFullName}</strong>
+                <button type="button" className="student-account-edit-trigger" onClick={openAccountModal}>
+                  <Settings size={15} aria-hidden="true" />
+                  تعديل الحساب
+                </button>
+              </div>
               {isUploadingAvatar && <span className="student-avatar-hint">جارٍ ضغط الصورة ورفعها...</span>}
               {avatarNotice && (
                 <span className={`student-avatar-notice ${avatarNotice.type}`} role="status" aria-live="polite">
@@ -1732,6 +1917,95 @@ export default function Home() {
               )}
             </div>
           </section>
+
+          {showAccountModal && (
+            <div
+              className="student-account-modal-backdrop"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget && !isSavingAccount) setShowAccountModal(false);
+              }}
+            >
+              <section className="student-account-modal" role="dialog" aria-modal="true" aria-labelledby="student-account-modal-title">
+                <header className="student-account-modal-header">
+                  <div>
+                    <h2 id="student-account-modal-title">تعديل الحساب</h2>
+                    <p>حدّث بيانات التواصل وكلمة المرور وصورتك الشخصية.</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="student-account-modal-close"
+                    onClick={() => setShowAccountModal(false)}
+                    disabled={isSavingAccount}
+                    aria-label="إغلاق"
+                  >
+                    <X size={19} aria-hidden="true" />
+                  </button>
+                </header>
+
+                <div className="student-account-avatar-editor">
+                  {loggedStudent?.avatar_url ? (
+                    <img src={loggedStudent.avatar_url} alt="الصورة الشخصية الحالية" />
+                  ) : (
+                    <span className="student-account-avatar-placeholder" aria-hidden="true"><i className="fa-solid fa-user" /></span>
+                  )}
+                  <label htmlFor="student-account-avatar-file" className="student-account-avatar-button">
+                    {isUploadingAvatar ? 'جارٍ رفع الصورة...' : 'تغيير الصورة'}
+                  </label>
+                  <input
+                    id="student-account-avatar-file"
+                    type="file"
+                    accept="image/*"
+                    disabled={isUploadingAvatar || isSavingAccount}
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      event.currentTarget.value = '';
+                      if (file) void uploadStudentAvatar(file);
+                    }}
+                  />
+                  {avatarNotice && <span className={`student-account-avatar-notice ${avatarNotice.type}`} role="status">{avatarNotice.message}</span>}
+                </div>
+
+                <form className="student-account-form" onSubmit={saveAccountChanges}>
+                  <label className="student-account-field">
+                    <span>البريد الإلكتروني</span>
+                    <input
+                      type="email"
+                      autoComplete="email"
+                      value={accountDraft.email}
+                      onChange={(event) => setAccountDraft((current) => ({ ...current, email: event.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label className="student-account-field">
+                    <span>رقم الموبايل</span>
+                    <input
+                      type="tel"
+                      autoComplete="tel"
+                      value={accountDraft.phone}
+                      onChange={(event) => setAccountDraft((current) => ({ ...current, phone: event.target.value }))}
+                    />
+                  </label>
+                  <label className="student-account-field">
+                    <span>كلمة المرور الجديدة <small>اتركها فارغة إذا لم ترد تغييرها</small></span>
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      minLength={8}
+                      value={accountDraft.password}
+                      onChange={(event) => setAccountDraft((current) => ({ ...current, password: event.target.value }))}
+                    />
+                  </label>
+                  {accountModalNotice && <p className="student-account-modal-notice" role="alert">{accountModalNotice}</p>}
+                  <div className="student-account-modal-actions">
+                    <button type="button" className="student-account-cancel" onClick={() => setShowAccountModal(false)} disabled={isSavingAccount}>إلغاء</button>
+                    <button type="submit" className="student-account-save" disabled={isSavingAccount || isUploadingAvatar}>
+                      {isSavingAccount ? 'جارٍ الحفظ...' : 'حفظ التعديلات'}
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+          )}
 
           {showProfileCompletion && (
             <div className="student-profile-completion-wrap">
@@ -2057,7 +2331,8 @@ export default function Home() {
                       action: 'student_tab_opened',
                       userType: 'student',
                       userId: loggedStudent?.['الرقم الجامعي'],
-                      username: String(loggedStudent?.['اسم الطالب'] ?? ''),
+                      username: studentFullName,
+                      fullName: studentFullName,
                       details: { tab: tab.key },
                     });
                   }}
@@ -2112,8 +2387,12 @@ export default function Home() {
                   </div>
                 ) : (
                   <div className="warning-list">
+                    {teacherAlertLoadError && <p className="teacher-alert-load-error" role="status">{teacherAlertLoadError}</p>}
                     {warnings.map((warning, index) => (
-                      <div key={`${warning['الرقم الجامعي'] ?? 'warning'}-${index}`} className="warning-item">
+                      <div
+                        key={`${warning['الرقم الجامعي'] ?? 'warning'}-${index}`}
+                        className={`warning-item${warning['مصدر التنبيه'] === 'teacher' ? ' teacher-alert-warning' : ''}`}
+                      >
                         <div className="warning-header">
                           <strong>{normalizeText(getValueByKeys(warning, ['نوع الإنذار']))}</strong>
                           <span className="warning-type">{normalizeText(getValueByKeys(warning, ['السبب']))}</span>
@@ -2123,6 +2402,7 @@ export default function Home() {
                     ))}
                   </div>
                 )}
+                {warnings.length === 0 && teacherAlertLoadError && <p className="teacher-alert-load-error" role="status">{teacherAlertLoadError}</p>}
 
               </div>
             )}

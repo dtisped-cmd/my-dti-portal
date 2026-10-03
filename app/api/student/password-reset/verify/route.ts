@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabase } from '../../../../../lib/supabase';
 import { normalizeStudentIdentifier } from '../../../../../lib/studentData';
+import { writeServerAuditLog } from '../../../../../lib/auditLogServer';
 
 export const dynamic = 'force-dynamic';
 
@@ -86,6 +87,24 @@ export async function POST(request: Request) {
     if (update.error) {
       const fallback = await supabase.from('students').update({ 'كلمة السر': newPassword }).eq(studentIdKey, studentId);
       if (fallback.error) return jsonError('password-update-failed', 500, fallback.error.message);
+    }
+
+    const fullName = [
+      student['اسم الطالب'] ?? student.name ?? student.student_name,
+      student['اسم الاب'] ?? student['اسم الأب'] ?? student.father_name,
+      student['الكنية'] ?? student.family_name ?? student.surname,
+    ].map(normalize).filter(Boolean).join(' ');
+    try {
+      await writeServerAuditLog(request, {
+        action: 'student_password_reset',
+        userType: 'student',
+        userId: studentId,
+        username: fullName,
+        fullName,
+        details: { method: 'password-recovery' },
+      });
+    } catch (auditError) {
+      console.error('Password reset audit logging failed:', auditError);
     }
 
     const { error: markUsedError } = await supabase

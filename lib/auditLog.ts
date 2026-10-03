@@ -1,8 +1,6 @@
-import { supabase } from './supabase';
-
 const deviceIdStorageKey = 'udti-device-id';
 
-type AuditUserType = 'student' | 'supervisor' | 'system';
+type AuditUserType = 'student' | 'teacher' | 'supervisor' | 'system';
 
 type AuditDetails = Record<string, unknown>;
 
@@ -22,6 +20,7 @@ export const writeAuditLog = (input: {
   userType: AuditUserType;
   userId?: string | number | null;
   username?: string | null;
+  fullName?: string | null;
   details?: AuditDetails;
 }) => {
   if (typeof window === 'undefined') return;
@@ -31,6 +30,7 @@ export const writeAuditLog = (input: {
     user_type: input.userType,
     user_id: input.userId === null || input.userId === undefined ? null : String(input.userId),
     username: input.username || null,
+    full_name: input.fullName || input.username || null,
     device_id: getDeviceId(),
     user_agent: navigator.userAgent || null,
     device_type: /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? 'mobile' : 'desktop',
@@ -38,11 +38,19 @@ export const writeAuditLog = (input: {
     language: navigator.language || null,
     screen_size: `${window.screen.width}x${window.screen.height}`,
     path: window.location.pathname,
-    ip_address: null,
     details: input.details ?? {},
   };
 
-  void supabase.from('سجلات النظام').insert([payload]).then(({ error }) => {
-    if (error) console.warn('[audit] log insert failed:', error.message);
+  void fetch('/api/audit-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    keepalive: true,
+  }).then(async (response) => {
+    if (response.ok) return;
+    const result = await response.json().catch(() => ({})) as { error?: string };
+    console.error('[audit] log insert failed:', result.error || response.statusText);
+  }).catch((error: unknown) => {
+    console.error('[audit] log request failed:', error);
   });
 };
