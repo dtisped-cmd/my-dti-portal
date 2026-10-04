@@ -7,6 +7,7 @@ export function buildStudentTelegramMessage({
   studentId,
   studentYear,
   studentClass,
+  username,
   statusText,
   title = 'تنبيه نظام الحضور والغياب',
 }: {
@@ -14,6 +15,7 @@ export function buildStudentTelegramMessage({
   studentId: string;
   studentYear: string;
   studentClass: string;
+  username?: string;
   statusText: string;
   title?: string;
 }) {
@@ -21,6 +23,7 @@ export function buildStudentTelegramMessage({
     `🔔 <b>${escapeHtml(title)}</b>`,
     '━━━━━━━━━━━━━━━━━━━',
     `👤 <b>الاسم:</b> ${escapeHtml(studentName)}`,
+    ...(username ? [`🔑 <b>اسم المستخدم:</b> ${escapeHtml(username)}`] : []),
     `🆔 <b>الرقم الجامعي:</b> ${escapeHtml(studentId)}`,
     `🎓 <b>السنة الدراسية:</b> ${escapeHtml(studentYear)}`,
     `📌 <b>الفئة:</b> ${escapeHtml(studentClass)}`,

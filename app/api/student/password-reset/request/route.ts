@@ -8,6 +8,12 @@ import { normalizeStudentIdentifier } from '../../../../../lib/studentData';
 export const dynamic = 'force-dynamic';
 
 const normalize = (value: unknown) => String(value ?? '').trim();
+const escapeHtml = (value: string) => value
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#039;');
 
 const maskEmail = (email: string) => {
   const [name, domain] = email.split('@');
@@ -95,7 +101,14 @@ export async function POST(request: Request) {
       return jsonError(tableMissing ? 'password-reset-table-missing' : 'reset-code-save-failed', 500, getErrorDetails(saveError));
     }
 
-    const studentName = normalize(student['اسم الطالب'] ?? student.name) || 'الطالب';
+    const studentName = [
+      student['اسم الطالب'] ?? student.name ?? student.student_name,
+      student['اسم الاب'] ?? student['اسم الأب'] ?? student.father_name,
+      student['الكنية'] ?? student.family_name ?? student.surname,
+    ].map(normalize).filter(Boolean).join(' ') || 'الطالب';
+    const username = normalize(
+      student['اسم المستخدم'] ?? student.username ?? student.user_name ?? student.login_username
+    ) || studentId;
     stage = method === 'telegram' ? 'send-telegram-code' : 'send-email-code';
 
     if (method === 'telegram' && chatId) {
@@ -108,6 +121,7 @@ export async function POST(request: Request) {
         studentId,
         studentYear: normalize(student['السنه الدراسية'] ?? student['السنة الدراسية']) || 'غير محدد',
         studentClass: normalize(student['الفئة']) || 'غير محددة',
+        username,
         statusText: `رمز استعادة كلمة المرور الخاص بك هو: ${code}\nصالح لمدة 15 دقيقة.`,
         title: 'استعادة كلمة المرور',
       });
@@ -119,7 +133,7 @@ export async function POST(request: Request) {
       const result = await sendEmail({
         to: email,
         subject: 'رمز استعادة كلمة المرور',
-        html: `<div dir="rtl" style="font-family:Arial,sans-serif;line-height:1.8"><h2>استعادة كلمة المرور</h2><p>مرحبًا ${studentName}،</p><p>رمز التحقق الخاص بك هو:</p><div style="font-size:30px;font-weight:800;letter-spacing:8px;color:#0f766e">${code}</div><p>الرمز صالح لمدة 15 دقيقة.</p></div>`,
+        html: `<div dir="rtl" style="font-family:Arial,sans-serif;line-height:1.8"><h2>استعادة كلمة المرور</h2><p>مرحبًا ${escapeHtml(studentName)}،</p><p><strong>اسم المستخدم:</strong> ${escapeHtml(username)}</p><p><strong>الرقم الجامعي:</strong> ${escapeHtml(studentId)}</p><p>رمز التحقق الخاص بك:</p><div style="font-size:30px;font-weight:800;letter-spacing:8px;color:#0f766e">${escapeHtml(code)}</div><p>الرمز صالح لمدة 15 دقيقة.</p></div>`,
       });
       if (!result.success) return jsonError('email-send-failed', 502, result.error ?? 'تعذر إرسال البريد الإلكتروني.');
     } else {
