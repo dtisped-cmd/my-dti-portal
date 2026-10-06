@@ -231,6 +231,7 @@ export async function POST(request: Request) {
         return {
           id: clean(student['الرقم الجامعي'] ?? student.student_id ?? student.studentId ?? student.id),
           fullName: getStudentName(student),
+          avatarUrl: clean(student.avatar_url) || '',
           className: clean(student['الفئة'] ?? student.class ?? student.class_name) || 'غير محدد',
           phone: clean(student['رقم الهاتف'] ?? student.phone),
           year: getStudentYear(student) || 'غير محدد',

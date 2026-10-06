@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, BookOpen, CalendarDays, Download, LogOut, RefreshCw, Trash2, Users } from 'lucide-react';
+import { AlertTriangle, BookOpen, CalendarDays, Download, LogOut, RefreshCw, Trash2, UserRound, Users, X } from 'lucide-react';
 import { writeAuditLog } from '../../lib/auditLog';
 
 const rememberedTeacherUsernameKey = 'udti-remembered-teacher-username';
@@ -17,6 +17,7 @@ type Teacher = {
 type Student = {
   id: string;
   fullName: string;
+  avatarUrl: string;
   className: string;
   phone: string;
   year: string;
@@ -60,6 +61,10 @@ const normalizeClassName = (value: string) => {
     : normalized;
 };
 
+const compareStudentsByName = (first: Student, second: Student) =>
+  first.fullName.localeCompare(second.fullName, 'ar', { sensitivity: 'base' })
+  || first.id.localeCompare(second.id, 'ar');
+
 export default function TeacherPortalPage() {
   const [loginDraft, setLoginDraft] = useState({ username: '', password: '' });
   const [rememberCredentials, setRememberCredentials] = useState(false);
@@ -71,6 +76,8 @@ export default function TeacherPortalPage() {
   const [selectedSubject, setSelectedSubject] = useState('');
   const [search, setSearch] = useState('');
   const [selectedClass, setSelectedClass] = useState('__all__');
+  const [studentView, setStudentView] = useState<'cards' | 'table'>('cards');
+  const [selectedStudentPhoto, setSelectedStudentPhoto] = useState<{ url: string; name: string } | null>(null);
   const [selectedStudentId, setSelectedStudentId] = useState('');
   const [alertMessage, setAlertMessage] = useState('');
   const alertMessageRef = useRef<HTMLTextAreaElement>(null);
@@ -94,6 +101,15 @@ export default function TeacherPortalPage() {
   useEffect(() => () => {
     if (welcomeTimeoutRef.current !== null) window.clearTimeout(welcomeTimeoutRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!selectedStudentPhoto) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedStudentPhoto(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [selectedStudentPhoto]);
 
   const request = async (payload: Record<string, unknown>) => {
     const response = await fetch('/api/teacher-portal', {
@@ -199,7 +215,9 @@ export default function TeacherPortalPage() {
   const subjectYearSeparator = selectedSubject.lastIndexOf(' · ');
   const selectedSubjectYear = subjectYearSeparator >= 0 ? selectedSubject.slice(subjectYearSeparator + 3) : '';
   const studentsForSubject = useMemo(
-    () => students.filter((student) => selectedSubjectYear && student.year === selectedSubjectYear),
+    () => students
+      .filter((student) => selectedSubjectYear && student.year === selectedSubjectYear)
+      .sort(compareStudentsByName),
     [students, selectedSubjectYear]
   );
   const studentClasses = useMemo(
@@ -233,6 +251,10 @@ export default function TeacherPortalPage() {
     () => alerts.filter((alert) => alert.subject === selectedSubject),
     [alerts, selectedSubject]
   );
+  const sortedVisibleStudents = useMemo(
+    () => visibleStudents.slice().sort(compareStudentsByName),
+    [visibleStudents]
+  );
 
   const exportStudents = async () => {
     if (!visibleStudents.length) return;
@@ -261,7 +283,7 @@ export default function TeacherPortalPage() {
       ];
 
       const subjectName = selectedSubject.split(' · ')[0] || selectedSubject;
-      worksheet.addRows(visibleStudents.map((student, index) => ({
+      worksheet.addRows(sortedVisibleStudents.map((student, index) => ({
         sequence: index + 1,
         fullName: student.fullName || 'غير مسجل',
         studentId: student.id,
@@ -515,13 +537,61 @@ export default function TeacherPortalPage() {
                   {exportingStudents ? 'جارٍ تجهيز الملف...' : `تنزيل Excel (${visibleStudents.length})`}
                 </button>
               </div>
-              <div className="teacher-table-wrap">
+              <div className="teacher-student-view-toggle" role="group" aria-label="طريقة عرض الطلاب">
+                <button
+                  type="button"
+                  className={studentView === 'cards' ? 'is-active' : ''}
+                  onClick={() => setStudentView('cards')}
+                  aria-pressed={studentView === 'cards'}
+                >
+                  كل طالب بمفرده
+                </button>
+                <button
+                  type="button"
+                  className={studentView === 'table' ? 'is-active' : ''}
+                  onClick={() => setStudentView('table')}
+                  aria-pressed={studentView === 'table'}
+                >
+                  عرض كجدول
+                </button>
+              </div>
+              <div className={`teacher-table-wrap${studentView === 'table' ? ' is-active' : ''}`}>
                 <table className="teacher-table">
                   <thead><tr><th>الطالب</th><th>الرقم الجامعي</th><th>الفئة</th><th>رقم الموبايل</th><th>السنة</th><th>حضور المادة</th><th>غياب المادة</th><th>إجراء</th></tr></thead>
                   <tbody>
-                    {visibleStudents.map((student) => (
+                    {sortedVisibleStudents.map((student) => (
                       <tr key={student.id}>
-                        <td>{student.fullName || 'غير مسجل'}</td><td>{student.id}</td><td>{student.className}</td><td dir="ltr">{student.phone || '—'}</td><td>{student.year}</td>
+                          <td>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                              {student.avatarUrl ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedStudentPhoto({
+                                    url: student.avatarUrl,
+                                    name: student.fullName || student.id,
+                                  })}
+                                  aria-label={`تكبير صورة ${student.fullName || student.id}`}
+                                  style={{ padding: 0, border: 0, borderRadius: '50%', background: 'none', cursor: 'zoom-in', lineHeight: 0 }}
+                                >
+                                  <img
+                                    src={student.avatarUrl}
+                                    alt={`صورة ${student.fullName || student.id}`}
+                                    loading="lazy"
+                                    style={{ width: 40, height: 40, borderRadius: '50%', objectFit: 'cover', display: 'block' }}
+                                  />
+                                </button>
+                              ) : (
+                                <span
+                                  role="img"
+                                  aria-label="لا توجد صورة شخصية"
+                                  style={{ width: 40, height: 40, borderRadius: '50%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+                                >
+                                  <UserRound size={20} aria-hidden="true" />
+                                </span>
+                              )}
+                              <span>{student.fullName || 'غير مسجل'}</span>
+                            </div>
+                          </td><td>{student.id}</td><td>{student.className}</td><td dir="ltr">{student.phone || '—'}</td><td>{student.year}</td>
                         <td><span className="teacher-count present">{student.presentCount}</span></td>
                         <td><span className="teacher-count absent">{student.absentCount}</span></td>
                         <td>
@@ -540,6 +610,60 @@ export default function TeacherPortalPage() {
                     {!visibleStudents.length && <tr><td colSpan={8} className="teacher-empty">لا يوجد طلاب مطابقون للبحث والفئة المحددة.</td></tr>}
                   </tbody>
                 </table>
+              </div>
+              <div className={`teacher-mobile-students${studentView === 'cards' ? ' is-active' : ''}`}>
+                {sortedVisibleStudents.map((student) => (
+                  <article className="teacher-mobile-student" key={student.id}>
+                    <div className="teacher-mobile-student-heading">
+                      {student.avatarUrl ? (
+                        <button
+                          type="button"
+                          className="teacher-mobile-student-avatar-button"
+                          onClick={() => setSelectedStudentPhoto({
+                            url: student.avatarUrl,
+                            name: student.fullName || student.id,
+                          })}
+                          aria-label={`تكبير صورة ${student.fullName || student.id}`}
+                        >
+                          <img
+                            src={student.avatarUrl}
+                            alt={`صورة ${student.fullName || student.id}`}
+                            loading="lazy"
+                          />
+                        </button>
+                      ) : (
+                        <span className="teacher-mobile-student-avatar-placeholder" role="img" aria-label="لا توجد صورة شخصية">
+                          <UserRound size={21} aria-hidden="true" />
+                        </span>
+                      )}
+                      <div className="teacher-mobile-student-name">
+                        <strong>{student.fullName || 'غير مسجل'}</strong>
+                        <span dir="ltr">{student.id}</span>
+                      </div>
+                    </div>
+                    <dl className="teacher-mobile-student-details">
+                      <div><dt>الفئة</dt><dd>{student.className}</dd></div>
+                      <div><dt>الموبايل</dt><dd dir="ltr">{student.phone || '—'}</dd></div>
+                      <div><dt>السنة</dt><dd>{student.year}</dd></div>
+                    </dl>
+                    <div className="teacher-mobile-student-footer">
+                      <span>حضور <b className="teacher-count present">{student.presentCount}</b></span>
+                      <span>غياب <b className="teacher-count absent">{student.absentCount}</b></span>
+                      <button
+                        type="button"
+                        className="teacher-student-alert-action"
+                        onClick={() => selectStudentForAlert(student.id)}
+                        aria-label={`إضافة تنبيه للطالب ${student.fullName || student.id}`}
+                      >
+                        <AlertTriangle size={15} aria-hidden="true" />
+                        تنبيه
+                      </button>
+                    </div>
+                  </article>
+                ))}
+                {!sortedVisibleStudents.length && (
+                  <p className="teacher-empty">لا يوجد طلاب مطابقون للبحث والفئة المحددة.</p>
+                )}
               </div>
             </section>
 
@@ -599,6 +723,35 @@ export default function TeacherPortalPage() {
               </div>
             </section>
           </>
+        )}
+        {selectedStudentPhoto && (
+          <div
+            onClick={() => setSelectedStudentPhoto(null)}
+            style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, background: 'rgba(0, 0, 0, 0.78)' }}
+          >
+            <section
+              role="dialog"
+              aria-modal="true"
+              aria-label={`صورة ${selectedStudentPhoto.name}`}
+              onClick={(event) => event.stopPropagation()}
+              style={{ position: 'relative', maxWidth: 'min(90vw, 800px)', maxHeight: '90vh' }}
+            >
+              <button
+                type="button"
+                onClick={() => setSelectedStudentPhoto(null)}
+                aria-label="إغلاق الصورة"
+                style={{ position: 'absolute', top: 8, insetInlineEnd: 8, zIndex: 1, display: 'grid', placeItems: 'center', width: 40, height: 40, border: 0, borderRadius: '50%', background: 'rgba(0, 0, 0, 0.65)', color: '#fff', cursor: 'pointer' }}
+              >
+                <X size={22} aria-hidden="true" />
+              </button>
+              <img
+                src={selectedStudentPhoto.url}
+                alt={`صورة ${selectedStudentPhoto.name}`}
+                style={{ display: 'block', maxWidth: '100%', maxHeight: '85vh', objectFit: 'contain', borderRadius: 12 }}
+              />
+              <p style={{ margin: '10px 0 0', textAlign: 'center', color: '#fff' }}>{selectedStudentPhoto.name}</p>
+            </section>
+          </div>
         )}
       </div>
     </main>
