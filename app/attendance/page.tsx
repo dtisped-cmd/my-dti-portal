@@ -3,11 +3,10 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
-import { CheckCircle2, ScanLine, UserRound } from 'lucide-react';
+import { CheckCircle2, ScanLine, UserRound, X } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { writeAuditLog } from '../../lib/auditLog';
 import { getClassAvailabilityOptions } from '../../lib/studentData';
-import { teacherEvaluationsTemporarilyDisabled } from '../../lib/featureFlags';
 import { buildStudentTelegramMessage, sendTelegramNotification } from '../../lib/telegram';
 
 type StudentRow = {
@@ -40,7 +39,16 @@ type StudentRow = {
 
 type AttendanceStatus = 'pending' | 'present' | 'absent';
 type AbsenceReason = 'غياب مبرر' | 'غياب غير مبرر';
-type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile' | 'teacher_accounts' | 'teacher_management' | 'class_schedule';
+type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile' | 'teacher_accounts' | 'teacher_management' | 'class_schedule' | 'feedback';
+type StudentFeedback = {
+  id: string;
+  kind: 'complaint' | 'suggestion';
+  category: string;
+  details: string;
+  student_id: string;
+  student_name: string;
+  created_at: string;
+};
 type AdminRecord = Record<string, unknown>;
 type AcademicTeacher = { id: string; teacher_name: string; is_active: boolean; login_username?: string | null };
 type AcademicSubject = { id: string; name: string; student_year: string; teacher_id: string };
@@ -254,11 +262,11 @@ const getSupervisorFeatures = (degree: string): SupervisorFeature[] => {
   const lowerDegree = normalizeText(degree).replace(/\s+/g, '').toLowerCase();
 
   if (normalizedDegree === '1' || ['moderator', 'مودرييتور', 'monitor', 'مراقب', 'المودرييتور'].includes(lowerDegree)) {
-    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'profile', 'teacher_accounts', 'teacher_management', 'class_schedule'];
+    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'create_student', 'profile', 'teacher_accounts', 'teacher_management', 'class_schedule', 'feedback'];
   }
 
   if (normalizedDegree === '2' || ['supervisor', 'سوبر', 'سوبرفايزور', 'super', 'supervisor2', 'fayzor', 'fayzur', 'فايزور', 'faizur'].includes(lowerDegree)) {
-    return ['attendance', 'create_student', 'profile'];
+    return ['attendance', 'profile'];
   }
 
   if (['3'].includes(normalizedDegree)) {
@@ -543,13 +551,6 @@ const getSupabaseErrorText = (error: unknown) => {
   }
 };
 
-const getTeacherEvaluationErrorText = (error: unknown) => {
-  const message = getSupabaseErrorText(error);
-  return message.includes('teacher-evaluation-server-key-missing')
-    ? 'أضف SUPABASE_SERVICE_ROLE_KEY إلى بيئة الخادم لتأمين التقييمات.'
-    : message;
-};
-
 const teacherAccountErrorText = (code: string) => ({
   'teacher-portal-server-key-missing': 'يجب إعداد مفتاح الخادم SUPABASE_SERVICE_ROLE_KEY أولاً.',
   'supervisor-credentials-required': 'سجّل الخروج ثم ادخل مجددًا بحساب مشرف الدرجة الأولى.',
@@ -569,6 +570,17 @@ const isDuplicateStudentIdError = (error: unknown) => {
 
   return status === 409 || code === '23505' || message.includes('duplicate') || message.includes('already exists');
 };
+
+const studentAccountErrorText = (code: string) => ({
+  'student-account-service-not-configured': 'يجب إعداد SUPABASE_SERVICE_ROLE_KEY في بيئة الخادم أولاً.',
+  'supervisor-credentials-required': 'انتهت صلاحية جلسة المشرف؛ سجّل الدخول مجددًا.',
+  'supervisor-credentials-invalid': 'تعذر التحقق من بيانات المشرف؛ سجّل الدخول مجددًا.',
+  'first-degree-supervisor-required': 'إنشاء حساب الطالب متاح لمشرفي الدرجة الأولى فقط.',
+  'required-student-fields-missing': 'أكمل الرقم الجامعي وكلمة السر والحقول المطلوبة.',
+  'invalid-student-year': 'السنة الدراسية يجب أن تكون أولى أو ثانية.',
+  'student-num-sequence-not-configured': 'يجب تشغيل supabase-student-account-num.sql في محرر SQL في Supabase لتفعيل الرقم التسلسلي للطلاب.',
+  'student-account-save-failed': 'تعذر حفظ حساب الطالب.',
+}[code] ?? 'تعذر إنشاء حساب الطالب؛ تحقق من البيانات وحاول مرة أخرى.');
 
 const getStudentIdentifier = (student: StudentRow) => {
   const direct = [
@@ -1034,6 +1046,7 @@ export default function AttendancePage() {
   const [messageComposerSending, setMessageComposerSending] = useState(false);
   const [sessionActive, setSessionActive] = useState(false);
   const [students, setStudents] = useState<StudentRow[]>([]);
+  const [selectedAttendancePhoto, setSelectedAttendancePhoto] = useState<{ url: string; name: string } | null>(null);
   const [attendanceData, setAttendanceData] = useState<Record<string, AttendanceEntry>>({});
   const [loading, setLoading] = useState(false);
   const [isSendingTelegramToAll, setIsSendingTelegramToAll] = useState(false);
@@ -1047,6 +1060,15 @@ export default function AttendancePage() {
   const qrScanHandlerRef = useRef<(rawValue: string) => void>(() => undefined);
   const scannedQrStudentIdsRef = useRef<Set<string>>(new Set());
   const qrScanSuccessTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!selectedAttendancePhoto) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSelectedAttendancePhoto(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [selectedAttendancePhoto]);
   const [supervisorLoggedIn, setSupervisorLoggedIn] = useState(false);
   const [supervisorSessionReady, setSupervisorSessionReady] = useState(false);
   const [supervisorUsername, setSupervisorUsername] = useState<string>('');
@@ -1055,6 +1077,10 @@ export default function AttendancePage() {
   const [supervisorFeatures, setSupervisorFeatures] = useState<SupervisorFeature[]>([]);
   const [supervisorDegree, setSupervisorDegree] = useState('');
   const [selectedFeature, setSelectedFeature] = useState<SupervisorFeature | null>(null);
+  const [studentFeedback, setStudentFeedback] = useState<StudentFeedback[]>([]);
+  const [studentFeedbackLoading, setStudentFeedbackLoading] = useState(false);
+  const [deletingStudentFeedbackId, setDeletingStudentFeedbackId] = useState('');
+  const [studentFeedbackError, setStudentFeedbackError] = useState('');
   const [recentSessions, setRecentSessions] = useState<RecentAttendanceSession[]>([]);
   const [activeSession, setActiveSession] = useState<RecentAttendanceSession | null>(null);
   const saveInProgressRef = useRef(false);
@@ -1071,15 +1097,6 @@ export default function AttendancePage() {
   const [supervisorForm, setSupervisorForm] = useState({ username: '', password: '', degree: '3' });
   const [supervisorProfileForm, setSupervisorProfileForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [supervisorProfileLoading, setSupervisorProfileLoading] = useState(false);
-  const [teacherEvaluationEnabled, setTeacherEvaluationEnabled] = useState(false);
-  const [teacherEvaluationSettingsLoading, setTeacherEvaluationSettingsLoading] = useState(false);
-  const [teacherEvaluationSettingsSaving, setTeacherEvaluationSettingsSaving] = useState(false);
-  const [teacherEvaluationSettingsNotice, setTeacherEvaluationSettingsNotice] = useState('');
-  const [showTeacherEvaluationReport, setShowTeacherEvaluationReport] = useState(false);
-  const [teacherEvaluationReportLoading, setTeacherEvaluationReportLoading] = useState(false);
-  const [teacherEvaluationReportTeachers, setTeacherEvaluationReportTeachers] = useState<AdminRecord[]>([]);
-  const [teacherEvaluationReportRows, setTeacherEvaluationReportRows] = useState<AdminRecord[]>([]);
-  const [teacherEvaluationReportError, setTeacherEvaluationReportError] = useState('');
   const [teacherAccountRows, setTeacherAccountRows] = useState<AdminRecord[]>([]);
   const [teacherAccountDrafts, setTeacherAccountDrafts] = useState<Record<string, { name: string; username: string; password: string; isActive: boolean }>>({});
   const [selectedTeacherAccountId, setSelectedTeacherAccountId] = useState('');
@@ -1269,6 +1286,74 @@ export default function AttendancePage() {
       setNotice(`تعذر تحميل سجلات النظام: ${getSupabaseErrorText(error)}`);
     } finally {
       setAdminLoading(false);
+    }
+  };
+
+  const loadStudentFeedback = async () => {
+    const password = supervisorPassword || window.localStorage.getItem(rememberedSupervisorPasswordKey) || '';
+    if (!supervisorUsername || !password) {
+      setStudentFeedbackError('تعذر استعادة بيانات جلسة المشرف. يرجى تسجيل الدخول إلى لوحة التحكم مجددًا.');
+      setStudentFeedback([]);
+      return;
+    }
+    setStudentFeedbackLoading(true);
+    setStudentFeedbackError('');
+    try {
+      const response = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'list', supervisorUsername, supervisorPassword: password }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string; submissions?: StudentFeedback[] };
+      if (!response.ok || !result.success) {
+        const messages: Record<string, string> = {
+          'first-degree-supervisor-required': 'عرض الشكاوى والاقتراحات متاح لمشرفي الدرجة الأولى فقط.',
+          'supervisor-credentials-invalid': 'انتهت صلاحية جلسة المشرف. يرجى تسجيل الدخول مجددًا.',
+          'supervisor-lookup-failed': 'تعذر التحقق من حساب المشرف حاليًا.',
+          'feedback-load-failed': 'تعذر تحميل الشكاوى والاقتراحات.',
+        };
+        throw new Error(messages[result.error ?? ''] ?? 'تعذر تحميل الشكاوى والاقتراحات.');
+      }
+      setStudentFeedback(result.submissions ?? []);
+    } catch (error) {
+      setStudentFeedback([]);
+      setStudentFeedbackError(error instanceof Error ? error.message : 'تعذر تحميل الشكاوى والاقتراحات.');
+    } finally {
+      setStudentFeedbackLoading(false);
+    }
+  };
+
+  const deleteStudentFeedback = async (id: string) => {
+    if (!window.confirm('هل تريد حذف هذه الشكوى أو الاقتراح نهائيًا؟ لا يمكن التراجع عن الحذف.')) return;
+    const password = supervisorPassword || window.localStorage.getItem(rememberedSupervisorPasswordKey) || '';
+    if (!supervisorUsername || !password) {
+      setStudentFeedbackError('تعذر استعادة بيانات جلسة المشرف. يرجى تسجيل الدخول إلى لوحة التحكم مجددًا.');
+      return;
+    }
+
+    setDeletingStudentFeedbackId(id);
+    setStudentFeedbackError('');
+    try {
+      const response = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id, supervisorUsername, supervisorPassword: password }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string };
+      if (!response.ok || !result.success) {
+        const messages: Record<string, string> = {
+          'first-degree-supervisor-required': 'حذف الرسائل متاح لمشرفي الدرجة الأولى فقط.',
+          'supervisor-credentials-invalid': 'انتهت صلاحية جلسة المشرف. يرجى تسجيل الدخول مجددًا.',
+          'feedback-not-found': 'هذه الرسالة حُذفت مسبقًا أو لم تعد موجودة.',
+          'feedback-delete-failed': 'تعذر حذف الرسالة. حاول مرة أخرى.',
+        };
+        throw new Error(messages[result.error ?? ''] ?? 'تعذر حذف الرسالة.');
+      }
+      setStudentFeedback((current) => current.filter((submission) => submission.id !== id));
+    } catch (error) {
+      setStudentFeedbackError(error instanceof Error ? error.message : 'تعذر حذف الرسالة.');
+    } finally {
+      setDeletingStudentFeedbackId('');
     }
   };
 
@@ -1594,77 +1679,6 @@ export default function AttendancePage() {
     }
   };
 
-  const refreshTeacherEvaluationSetting = async () => {
-    if (teacherEvaluationsTemporarilyDisabled) {
-      setTeacherEvaluationEnabled(false);
-      setTeacherEvaluationSettingsNotice('تقييم المدرسين متوقف مؤقتًا.');
-      return;
-    }
-    setTeacherEvaluationSettingsLoading(true);
-    setTeacherEvaluationSettingsNotice('');
-    try {
-      const response = await fetch('/api/supervisor/teacher-evaluations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'settings', username: supervisorUsername, password: supervisorPassword }),
-      });
-      const result = await response.json() as { success?: boolean; enabled?: boolean; error?: string };
-      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-settings-failed');
-      setTeacherEvaluationEnabled(result.enabled === true);
-    } catch (error) {
-      setTeacherEvaluationSettingsNotice(`تعذر تحميل الإعداد: ${getTeacherEvaluationErrorText(error)}`);
-    } finally {
-      setTeacherEvaluationSettingsLoading(false);
-    }
-  };
-
-  const toggleTeacherEvaluation = async () => {
-    if (teacherEvaluationsTemporarilyDisabled) {
-      setTeacherEvaluationSettingsNotice('تقييم المدرسين متوقف مؤقتًا.');
-      return;
-    }
-    const nextValue = !teacherEvaluationEnabled;
-    setTeacherEvaluationSettingsSaving(true);
-    setTeacherEvaluationSettingsNotice('');
-    try {
-      const response = await fetch('/api/supervisor/teacher-evaluations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set-enabled', username: supervisorUsername, password: supervisorPassword, enabled: nextValue }),
-      });
-      const result = await response.json() as { success?: boolean; enabled?: boolean; error?: string };
-      if (!response.ok || !result.success || result.enabled !== nextValue) {
-        throw new Error(result.error || 'لم يتم تثبيت حالة التفعيل في قاعدة البيانات.');
-      }
-      setTeacherEvaluationEnabled(nextValue);
-      setTeacherEvaluationSettingsNotice(nextValue ? 'تم تفعيل تقييم المدرسين للطلاب.' : 'تم إيقاف تقييم المدرسين.');
-    } catch (error) {
-      setTeacherEvaluationSettingsNotice(`تعذر حفظ الإعداد: ${getTeacherEvaluationErrorText(error)}`);
-    } finally {
-      setTeacherEvaluationSettingsSaving(false);
-    }
-  };
-
-  const refreshTeacherEvaluationReport = async () => {
-    setTeacherEvaluationReportLoading(true);
-    setTeacherEvaluationReportError('');
-    try {
-      const response = await fetch('/api/supervisor/teacher-evaluations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'report', username: supervisorUsername, password: supervisorPassword }),
-      });
-      const result = await response.json() as { success?: boolean; teachers?: AdminRecord[]; evaluations?: AdminRecord[]; error?: string };
-      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-report-failed');
-      setTeacherEvaluationReportTeachers(result.teachers ?? []);
-      setTeacherEvaluationReportRows(result.evaluations ?? []);
-    } catch (error) {
-      setTeacherEvaluationReportError(`تعذر تحميل التقييمات: ${getTeacherEvaluationErrorText(error)}`);
-    } finally {
-      setTeacherEvaluationReportLoading(false);
-    }
-  };
-
   const sanitizedStudentUpdatePayload = (payload: Record<string, string>) => {
     return Object.fromEntries(
       Object.entries(payload).filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== '')
@@ -1879,14 +1893,30 @@ export default function AttendancePage() {
       payload['الفئة'] = chosenClass;
     }
 
-    const canCreateAccount = ['1', '2'].includes(supervisorDegree) || supervisorFeatures.includes('students');
+    const canCreateAccount = supervisorDegree === '1' && supervisorFeatures.includes('create_student');
     if (!canCreateAccount) {
       setNotice('لا توجد صلاحية لإنشاء حساب طالب في هذا المستوى.');
       return;
     }
 
     try {
-      const { error } = await supabase.from('students').insert([payload]);
+      const response = await fetch('/api/student-accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          supervisorUsername,
+          supervisorPassword,
+          student: payload,
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string; code?: string; detail?: string };
+      const error = !response.ok || !result.success
+        ? {
+          message: result.error ? studentAccountErrorText(result.error) : 'تعذر إنشاء حساب الطالب.',
+          code: result.code,
+          detail: result.detail,
+        }
+        : null;
       if (error) {
         console.error('Supabase Error Detail:', error);
 
@@ -1895,7 +1925,7 @@ export default function AttendancePage() {
           return;
         }
 
-        setNotice(`تعذر إنشاء حساب الطالب: ${error.message}`);
+        setNotice(`تعذر إنشاء حساب الطالب: ${error.message}${error.detail ? ` (${error.detail})` : ''}`);
         return;
       }
 
@@ -2317,12 +2347,6 @@ export default function AttendancePage() {
   useEffect(() => {
     if (supervisorLoggedIn && selectedFeature === 'students') {
       void refreshStudentDirectory();
-    }
-  }, [supervisorLoggedIn, selectedFeature]);
-
-  useEffect(() => {
-    if (supervisorLoggedIn && selectedFeature === 'supervisors') {
-      void refreshTeacherEvaluationSetting();
     }
   }, [supervisorLoggedIn, selectedFeature]);
 
@@ -3071,6 +3095,23 @@ export default function AttendancePage() {
             </div>
 
             <div className="supervisor-feature-grid">
+              {supervisorFeatures.includes('feedback') && (
+                <button type="button" className="supervisor-feature-card" onClick={() => {
+                  setSelectedFeature('feedback');
+                  setStudentFeedbackError('');
+                  const stored = JSON.parse(window.localStorage.getItem(supervisorSessionStorageKey) || '{}') as StoredSupervisorSession;
+                  window.localStorage.setItem(supervisorSessionStorageKey, JSON.stringify({ ...stored, selectedFeature: 'feedback' }));
+                  writeAuditLog({ action: 'feature_opened', userType: 'supervisor', username: supervisorUsername, details: { feature: 'feedback' } });
+                  void loadStudentFeedback();
+                }}>
+                  <span className="feature-icon" aria-hidden="true">✉</span>
+                  <span>
+                    <strong>شكاوى ومقترحات الطلاب</strong>
+                    <small>قراءة رسائل الطلاب والاطلاع على تفاصيلها</small>
+                  </span>
+                  <span className="feature-arrow" aria-hidden="true">←</span>
+                </button>
+              )}
               {supervisorFeatures.includes('attendance') && (
                 <button
                   type="button"
@@ -3123,7 +3164,7 @@ export default function AttendancePage() {
                   <span className="feature-icon" aria-hidden="true">＋</span>
                   <span>
                     <strong>إنشاء حساب</strong>
-                    <small>إنشاء حساب طالب جديد فقط للرتبة 2</small>
+                    <small>إنشاء حساب طالب جديد لمشرفي الدرجة الأولى</small>
                   </span>
                   <span className="feature-arrow" aria-hidden="true">←</span>
                 </button>
@@ -3219,6 +3260,48 @@ export default function AttendancePage() {
                 <span className="feature-arrow" aria-hidden="true">←</span>
               </button>
             </div>
+          </section>
+        )}
+
+        {supervisorLoggedIn && supervisorFeatures.includes('feedback') && selectedFeature === 'feedback' && (
+          <section className="admin-dashboard-panel">
+            <div className="admin-dashboard-heading">
+              <div>
+                <span className="feature-panel-kicker">وظائف المشرف</span>
+                <h1>شكاوى ومقترحات الطلاب</h1>
+                <p>عرض الرسائل المرسلة من الطلاب وتفاصيلها وبيانات أصحابها.</p>
+              </div>
+              <button type="button" className="action-button primary" onClick={() => void loadStudentFeedback()} disabled={studentFeedbackLoading}>
+                {studentFeedbackLoading ? 'جارٍ التحديث...' : 'تحديث الرسائل'}
+              </button>
+            </div>
+            {studentFeedbackError && <p className="teacher-account-notice error" role="alert">{studentFeedbackError}</p>}
+            {studentFeedbackLoading ? (
+              <div className="loading-box">جارٍ تحميل الرسائل...</div>
+            ) : studentFeedback.length ? (
+              <div className="admin-record-list">
+                {studentFeedback.map((submission) => (
+                  <article className="admin-record-item" key={submission.id}>
+                    <strong>{submission.kind === 'complaint' ? 'شكوى' : 'اقتراح'} — {submission.category}</strong>
+                    <span style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{submission.details}</span>
+                    <span>المرسل: {submission.student_name} · الرقم الجامعي: {submission.student_id}</span>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <time dateTime={submission.created_at}>{new Date(submission.created_at).toLocaleString('ar-SY')}</time>
+                      <button
+                        type="button"
+                        className="action-button danger"
+                        onClick={() => void deleteStudentFeedback(submission.id)}
+                        disabled={Boolean(deletingStudentFeedbackId)}
+                      >
+                        {deletingStudentFeedbackId === submission.id ? 'جارٍ الحذف...' : 'حذف الرسالة'}
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : !studentFeedbackError ? (
+              <div className="loading-box">لا توجد شكاوى أو اقتراحات مسجلة.</div>
+            ) : null}
           </section>
         )}
 
@@ -3881,97 +3964,6 @@ export default function AttendancePage() {
         {supervisorLoggedIn && selectedFeature === 'supervisors' && (
           <section className="admin-dashboard-panel">
             <div className="admin-dashboard-heading"><div><span className="feature-panel-kicker">إدارة الحسابات</span><h1>إدارة المشرفين</h1><p>يمكن للدرجة الأولى إنشاء الحسابات وتغيير الدرجات وكلمات المرور.</p></div><button type="button" className="action-button primary" onClick={() => void refreshAdminData()}>تحديث</button></div>
-            <div className="teacher-evaluation-admin-setting">
-              <div>
-                <strong>تقييم المدرسين</strong>
-                <p>{teacherEvaluationsTemporarilyDisabled ? 'الميزة متوقفة مؤقتًا حتى استقرار التقييمات.' : 'عند التفعيل، تظهر قائمة المدرسين ومقرراتهم في حساب الطالب ليقيّم الشرح.'}</p>
-              </div>
-              <button
-                type="button"
-                className={`action-button teacher-evaluation-toggle${teacherEvaluationEnabled ? ' is-enabled' : ''}`}
-                aria-pressed={teacherEvaluationEnabled}
-                onClick={() => void toggleTeacherEvaluation()}
-                disabled={teacherEvaluationsTemporarilyDisabled || teacherEvaluationSettingsLoading || teacherEvaluationSettingsSaving}
-              >
-                {teacherEvaluationsTemporarilyDisabled ? 'متوقفة مؤقتًا' : teacherEvaluationSettingsLoading ? 'جارٍ تحميل الإعداد...' : teacherEvaluationSettingsSaving ? 'جارٍ الحفظ...' : teacherEvaluationEnabled ? 'إيقاف الميزة' : 'تفعيل الميزة'}
-              </button>
-              <button
-                type="button"
-                className="action-button"
-                disabled={teacherEvaluationsTemporarilyDisabled}
-                onClick={() => {
-                  const nextVisibility = !showTeacherEvaluationReport;
-                  setShowTeacherEvaluationReport(nextVisibility);
-                  if (nextVisibility) void refreshTeacherEvaluationReport();
-                }}
-              >
-                {teacherEvaluationsTemporarilyDisabled ? 'التقييمات موقوفة' : showTeacherEvaluationReport ? 'إخفاء التقييمات' : 'عرض التقييمات'}
-              </button>
-              {teacherEvaluationSettingsNotice && <span className="teacher-evaluation-admin-notice" role="status">{teacherEvaluationSettingsNotice}</span>}
-            </div>
-            {showTeacherEvaluationReport && !teacherEvaluationsTemporarilyDisabled && (
-              <section className="teacher-evaluation-report" aria-label="تقييمات المدرسين">
-                <div className="teacher-evaluation-report-heading">
-                  <h2>تقييمات المدرسين والمواد</h2>
-                  <button type="button" className="action-button" onClick={() => void refreshTeacherEvaluationReport()} disabled={teacherEvaluationReportLoading}>
-                    {teacherEvaluationReportLoading ? 'جارٍ التحديث...' : 'تحديث النتائج'}
-                  </button>
-                </div>
-                {teacherEvaluationReportError && <p className="teacher-evaluation-report-error" role="alert">{teacherEvaluationReportError}</p>}
-                {teacherEvaluationReportLoading ? (
-                  <div className="loading-box">جارٍ تحميل التقييمات...</div>
-                ) : teacherEvaluationReportTeachers.length === 0 ? (
-                  <div className="loading-box">لا يوجد مدرسون في الجدول.</div>
-                ) : (
-                  <div className="teacher-evaluation-report-list">
-                    {teacherEvaluationReportTeachers.map((teacher) => {
-                      const teacherId = String(teacher.id ?? '');
-                      const teacherRows = teacherEvaluationReportRows.filter((row) => String(row.teacher_id ?? '') === teacherId);
-                      const scoredRows = teacherRows.map((row) => Number(row.rating)).filter((rating) => rating > 0);
-                      const average = scoredRows.length
-                        ? (scoredRows.reduce((total, rating) => total + rating, 0) / scoredRows.length).toFixed(1)
-                        : '—';
-                      const subjects = Array.isArray(teacher.subjects) ? teacher.subjects.map(String).join('، ') : 'لا توجد مقررات';
-
-                      return (
-                        <article className="teacher-evaluation-report-card" key={teacherId}>
-                          <header>
-                            <div>
-                              <h3>{String(teacher.teacher_name ?? 'مدرس')}</h3>
-                              <p>المقررات: {subjects}</p>
-                            </div>
-                            <div className="teacher-evaluation-report-summary">
-                              <span>عدد التقييمات: {teacherRows.length}</span>
-                              <span>المعدل (باستثناء لا أعلم): {average}</span>
-                            </div>
-                          </header>
-                          {teacherRows.length === 0 ? (
-                            <p className="teacher-evaluation-report-empty">لم يقيّم الطلاب هذا المدرس بعد.</p>
-                          ) : (
-                            <div className="teacher-evaluation-report-entries">
-                              {teacherRows.map((row) => {
-                                const rating = Number(row.rating);
-                                const ratingLabel = ['لا أعلم', 'سيئ', 'مقبول', 'جيد', 'رائع'][rating] ?? 'غير معروف';
-                                return (
-                                  <div className="teacher-evaluation-report-entry" key={String(row.id)}>
-                                    <strong>{String(row.student_name ?? 'اسم غير مسجل')}</strong>
-                                    <span>الرقم الجامعي: {String(row.student_id ?? 'غير متوفر')}</span>
-                                    <span>المقرر: {String(row.subject ?? 'غير محدد')}</span>
-                                    <span>التقييم: {ratingLabel}</span>
-                                    <p>الملاحظة: {String(row.note ?? '').trim() || 'لا توجد ملاحظة'}</p>
-                                    <time>{String(row.updated_at ?? '')}</time>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </article>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-            )}
             <form className="admin-supervisor-form" onSubmit={handleSupervisorFormSubmit}>
               <input value={supervisorForm.username} onChange={(event) => setSupervisorForm({ ...supervisorForm, username: event.target.value })} placeholder="اسم المستخدم" required />
               <input value={supervisorForm.password} onChange={(event) => setSupervisorForm({ ...supervisorForm, password: event.target.value })} placeholder={editingSupervisorId ? 'كلمة مرور جديدة (اختياري)' : 'كلمة المرور'} type="password" required={!editingSupervisorId} />
@@ -4107,18 +4099,6 @@ export default function AttendancePage() {
             </div>
 
             <div className="field-group">
-              <label htmlFor="course-select">اختر المادة</label>
-              <select id="course-select" value={selectedCourse} onChange={(e) => setSelectedCourse(e.target.value)}>
-                <option value="">-- اختر المادة --</option>
-                {(academicManagementLoaded
-                  ? academicSubjects.filter((item) => item.student_year === selectedYear).map((item) => item.name)
-                  : courseOptions).map((course) => (
-                  <option value={course} key={course}>{course}</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="field-group">
               <label htmlFor="year-select">السنة الدراسية</label>
               <select id="year-select" value={selectedYear} onChange={(e) => {
                 const nextYear = e.target.value;
@@ -4132,6 +4112,18 @@ export default function AttendancePage() {
               }}>
                 {yearOptions.map((year) => (
                   <option value={year} key={year}>سنة {year}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field-group">
+              <label htmlFor="course-select">اختر المادة</label>
+              <select id="course-select" value={selectedCourse} onChange={(e) => setSelectedCourse(e.target.value)}>
+                <option value="">-- اختر المادة --</option>
+                {(academicManagementLoaded
+                  ? academicSubjects.filter((item) => item.student_year === selectedYear).map((item) => item.name)
+                  : courseOptions).map((course) => (
+                  <option value={course} key={course}>{course}</option>
                 ))}
               </select>
             </div>
@@ -4256,7 +4248,10 @@ export default function AttendancePage() {
             )}
 
             <div className="student-grid">
-              {students.map((student) => {
+              {students.slice().sort((first, second) =>
+                getFullStudentName(first).localeCompare(getFullStudentName(second), 'ar', { sensitivity: 'base' })
+                || getStudentIdentifier(first).localeCompare(getStudentIdentifier(second), 'ar')
+              ).map((student) => {
                 const studentId = getStudentIdentifier(student);
                 const entry = attendanceData[studentId];
                 const status = entry?.status ?? 'pending';
@@ -4264,7 +4259,31 @@ export default function AttendancePage() {
                 return (
                   <div key={studentId || getFullStudentName(student)} className={`student-card ${status}`}>
                     <div className="student-card-top">
-                      <div className="student-name">{getFullStudentName(student)}</div>
+                      <div className="attendance-student-identity">
+                        {student.avatar_url ? (
+                          <button
+                            type="button"
+                            className="attendance-student-avatar-button"
+                            onClick={() => setSelectedAttendancePhoto({
+                              url: student.avatar_url!,
+                              name: getFullStudentName(student),
+                            })}
+                            aria-label={`تكبير صورة ${getFullStudentName(student)}`}
+                          >
+                            <img
+                              className="attendance-student-avatar"
+                              src={student.avatar_url}
+                              alt={`صورة ${getFullStudentName(student)}`}
+                              loading="lazy"
+                            />
+                          </button>
+                        ) : (
+                          <span className="attendance-student-avatar-placeholder" role="img" aria-label="لا توجد صورة شخصية">
+                            <UserRound size={22} aria-hidden="true" />
+                          </span>
+                        )}
+                        <div className="student-name">{getFullStudentName(student)}</div>
+                      </div>
                       <div className="student-id">{studentId || 'بدون رقم'}</div>
                     </div>
 
@@ -4288,6 +4307,29 @@ export default function AttendancePage() {
                 );
               })}
             </div>
+
+            {selectedAttendancePhoto && (
+              <div className="attendance-photo-backdrop" onClick={() => setSelectedAttendancePhoto(null)}>
+                <section
+                  className="attendance-photo-dialog"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label={`صورة ${selectedAttendancePhoto.name}`}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    className="attendance-photo-close"
+                    onClick={() => setSelectedAttendancePhoto(null)}
+                    aria-label="إغلاق الصورة"
+                  >
+                    <X size={22} aria-hidden="true" />
+                  </button>
+                  <img src={selectedAttendancePhoto.url} alt={`صورة ${selectedAttendancePhoto.name}`} />
+                  <p>{selectedAttendancePhoto.name}</p>
+                </section>
+              </div>
+            )}
 
             <div className="session-actions">
               <button

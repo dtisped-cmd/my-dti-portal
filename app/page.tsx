@@ -5,7 +5,6 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Code2, Download, Pencil, Settings, X } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { writeAuditLog } from '../lib/auditLog';
-import { teacherEvaluationsTemporarilyDisabled } from '../lib/featureFlags';
 import {
   getStudentById,
   getTeacherAlertsForStudent,
@@ -16,20 +15,12 @@ import {
   StudentRow,
 } from '../lib/studentData';
 
-type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills' | 'evaluations';
+type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills';
 
 type StudentSkill = {
   category: string;
   detail: string;
 };
-
-type TeacherEntry = {
-  id: string;
-  name: string;
-  subjects: string[];
-};
-
-type TeacherRating = 0 | 1 | 2 | 3 | 4;
 
 type ScheduleItem = {
   id: string | number;
@@ -173,14 +164,6 @@ const getTableRows = async (tableNames: string[], select = '*') => {
 const scheduleDays = ['الأحد', 'الأثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
 const skillCategories = ['مونتاج', 'رياضة', 'تصوير', 'تصميم جرافيكي', 'برمجة', 'رسم', 'كتابة', 'لغات', 'موسيقى', 'تطوع', 'أخرى'];
 const sportTypes = ['كرة القدم', 'كرة السلة', 'كرة الطائرة', 'السباحة', 'الجري', 'رياضة أخرى'];
-const teacherRatingOptions: Array<{ value: TeacherRating; label: string }> = [
-  { value: 4, label: 'رائع' },
-  { value: 3, label: 'جيد' },
-  { value: 2, label: 'مقبول' },
-  { value: 1, label: 'سيئ' },
-  { value: 0, label: 'لا أعلم' },
-];
-
 const formatScheduleTime = (value: unknown) => String(value ?? '').slice(0, 5);
 
 const getStudentGroup = (student: Record<string, unknown> | null | undefined) => String(
@@ -249,18 +232,6 @@ export default function Home() {
   const [isSavingSkills, setIsSavingSkills] = useState(false);
   const [skillsMessage, setSkillsMessage] = useState('');
   const [showProfileCompletion, setShowProfileCompletion] = useState(true);
-  const [teacherEvaluationLoading, setTeacherEvaluationLoading] = useState(false);
-  const [teacherEvaluationReady, setTeacherEvaluationReady] = useState(false);
-  const [teacherEvaluationRequired, setTeacherEvaluationRequired] = useState(false);
-  const [teacherEvaluationError, setTeacherEvaluationError] = useState('');
-  const [teachers, setTeachers] = useState<TeacherEntry[]>([]);
-  const [teacherRatingDrafts, setTeacherRatingDrafts] = useState<Record<string, TeacherRating>>({});
-  const [teacherRatingNotes, setTeacherRatingNotes] = useState<Record<string, string>>({});
-  const [savedTeacherRatings, setSavedTeacherRatings] = useState<Record<string, TeacherRating>>({});
-  const [savedTeacherNotes, setSavedTeacherNotes] = useState<Record<string, string>>({});
-  const [savingTeacherRatingKey, setSavingTeacherRatingKey] = useState<string | null>(null);
-  const [teacherRatingNotice, setTeacherRatingNotice] = useState('');
-  const studentDashboardRef = useRef<HTMLDivElement>(null);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [showAccountModal, setShowAccountModal] = useState(false);
@@ -283,6 +254,10 @@ export default function Home() {
   const [telegramChatIdInput, setTelegramChatIdInput] = useState('');
   const [capsLockOn, setCapsLockOn] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [showFeedbackForm, setShowFeedbackForm] = useState(false);
+  const [feedbackDraft, setFeedbackDraft] = useState({ kind: 'complaint' as 'complaint' | 'suggestion', category: 'مدرس', details: '' });
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState('');
   const [showPasswordReset, setShowPasswordReset] = useState(false);
   const [resetIdentifier, setResetIdentifier] = useState('');
   const [resetMethods, setResetMethods] = useState<Array<'telegram' | 'email'>>([]);
@@ -305,14 +280,6 @@ export default function Home() {
   const studentQrId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
   const studentQrData = `UDTI|${studentFullName}|${studentQrId}`;
   const studentQrHighResolutionUrl = `https://api.qrserver.com/v1/create-qr-code/?size=1000x1000&data=${encodeURIComponent(studentQrData)}`;
-  const teacherEvaluationGateOpen = isLoggedIn && (!teacherEvaluationReady || teacherEvaluationRequired);
-
-  useEffect(() => {
-    const dashboard = studentDashboardRef.current;
-    if (!dashboard) return;
-    if (teacherEvaluationGateOpen) dashboard.setAttribute('inert', '');
-    else dashboard.removeAttribute('inert');
-  }, [teacherEvaluationGateOpen]);
   const profileChecklist = [
     { label: 'الصورة الشخصية', weight: 30, complete: Boolean(loggedStudent?.avatar_url) },
     { label: 'إضافة مهارة', weight: 30, complete: studentSkills.length > 0 },
@@ -324,173 +291,6 @@ export default function Home() {
     0
   );
   const missingProfileTasks = profileChecklist.filter((task) => !task.complete).map((task) => task.label);
-  const getTeacherRatingKey = (teacherId: string, subject: string) => `${teacherId}::${subject}`;
-  const teacherEvaluationTasks = teachers.flatMap((teacher) => teacher.subjects.map((subject) => ({
-    teacher,
-    subject,
-    key: getTeacherRatingKey(teacher.id, subject),
-  })));
-  const pendingTeacherEvaluationCount = teacherEvaluationTasks.filter((task) => savedTeacherRatings[task.key] === undefined).length;
-
-  useEffect(() => {
-    if (teacherEvaluationsTemporarilyDisabled || !isLoggedIn || !studentQrId) {
-      setTeacherEvaluationLoading(false);
-      setTeacherEvaluationReady(false);
-      setTeacherEvaluationRequired(false);
-      setTeacherEvaluationError('');
-      setTeachers([]);
-      setTeacherRatingDrafts({});
-      setTeacherRatingNotes({});
-      setSavedTeacherRatings({});
-      setSavedTeacherNotes({});
-      if (isLoggedIn && teacherEvaluationsTemporarilyDisabled) setTeacherEvaluationReady(true);
-      return;
-    }
-
-    let cancelled = false;
-    setTeacherEvaluationReady(false);
-    setTeacherEvaluationRequired(false);
-    setTeacherEvaluationLoading(true);
-    setTeacherEvaluationError('');
-    setTeacherRatingNotice('');
-
-    const loadTeacherEvaluations = async () => {
-      try {
-        const response = await fetch('/api/student/teacher-evaluations', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'load',
-            studentId: studentQrId,
-            password: String(loggedStudent?.['كلمة السر'] ?? loggedStudent?.password ?? ''),
-          }),
-        });
-        const result = await response.json() as {
-          success?: boolean;
-          enabled?: boolean;
-          error?: string;
-          teachers?: Array<Record<string, unknown>>;
-          ratings?: Array<Record<string, unknown>>;
-        };
-        if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-load-failed');
-        if (cancelled) return;
-
-        if (!result.enabled) {
-          setTeacherEvaluationReady(true);
-          setTeacherEvaluationRequired(false);
-          setTeachers([]);
-          setTeacherRatingDrafts({});
-          setTeacherRatingNotes({});
-          setSavedTeacherRatings({});
-          setSavedTeacherNotes({});
-          setTeacherEvaluationError('');
-          setActiveTab((current) => current === 'evaluations' ? 'record' : current);
-          return;
-        }
-
-        setTeacherEvaluationRequired(true);
-        setActiveTab('evaluations');
-        const teacherRows = Array.isArray(result.teachers) ? result.teachers : [];
-        const loadedTeachers = teacherRows.flatMap((row) => {
-          const id = String(row.id ?? '').trim();
-          const name = String(row.teacher_name ?? '').trim();
-          const subjects = Array.isArray(row.subjects)
-            ? [...new Set(row.subjects.map((subject) => String(subject).trim()).filter(Boolean))]
-            : [];
-          return id && name ? [{ id, name, subjects }] : [];
-        });
-        if (!loadedTeachers.length || loadedTeachers.some((teacher) => teacher.subjects.length === 0)) {
-          throw new Error('لم تتم إضافة مدرسين مع مقرراتهم. أضف مدرسًا ومادة واحدة على الأقل لكل مدرس من جدول teachers.');
-        }
-        setTeachers(loadedTeachers);
-
-        const ratingRows = Array.isArray(result.ratings) ? result.ratings : [];
-        const storedRatings: Record<string, TeacherRating> = {};
-        const storedNotes: Record<string, string> = {};
-        ratingRows.forEach((row) => {
-          const teacherId = String(row.teacher_id ?? '');
-          const subject = String(row.subject ?? '');
-          const rating = Number(row.rating);
-          if (teacherId && subject && [0, 1, 2, 3, 4].includes(rating)) {
-            storedRatings[getTeacherRatingKey(teacherId, subject)] = rating as TeacherRating;
-            storedNotes[getTeacherRatingKey(teacherId, subject)] = String(row.note ?? '');
-          }
-        });
-        setSavedTeacherRatings(storedRatings);
-        setSavedTeacherNotes(storedNotes);
-        setTeacherRatingDrafts(storedRatings);
-        setTeacherRatingNotes(storedNotes);
-        const pendingCount = loadedTeachers.reduce((total, teacher) => (
-          total + teacher.subjects.filter((subject) => storedRatings[getTeacherRatingKey(teacher.id, subject)] === undefined).length
-        ), 0);
-        setTeacherEvaluationRequired(pendingCount > 0);
-        setTeacherEvaluationReady(true);
-        setTeacherEvaluationError('');
-        setActiveTab(pendingCount > 0 ? 'evaluations' : 'record');
-      } catch (error) {
-        if (!cancelled) {
-          const errorDetail = error instanceof Error ? error.message : String(error);
-          const errorMessage = errorDetail.includes('teacher-evaluation-server-key-missing')
-            ? 'يجب إعداد SUPABASE_SERVICE_ROLE_KEY في بيئة الخادم لتفعيل بوابة التقييم السرية.'
-            : `تعذر تحميل التقييمات: ${errorDetail}`;
-          setTeacherEvaluationRequired(true);
-          setTeacherEvaluationReady(true);
-          setTeacherEvaluationError(errorMessage);
-          setActiveTab('evaluations');
-        }
-      } finally {
-        if (!cancelled) setTeacherEvaluationLoading(false);
-      }
-    };
-
-    void loadTeacherEvaluations();
-    return () => {
-      cancelled = true;
-    };
-  }, [isLoggedIn, studentQrId]);
-
-  const saveTeacherRating = async (teacher: TeacherEntry, subject: string) => {
-    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
-    const key = getTeacherRatingKey(teacher.id, subject);
-    const rating = teacherRatingDrafts[key];
-    if (!studentId || rating === undefined) return;
-
-    setSavingTeacherRatingKey(key);
-    setTeacherRatingNotice('');
-    try {
-      const response = await fetch('/api/student/teacher-evaluations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'save',
-          studentId,
-          password: String(loggedStudent?.['كلمة السر'] ?? loggedStudent?.password ?? ''),
-          teacherId: teacher.id,
-          subject,
-          rating,
-          note: teacherRatingNotes[key]?.trim() ?? '',
-        }),
-      });
-      const result = await response.json() as { success?: boolean; error?: string };
-      if (!response.ok || !result.success) throw new Error(result.error || 'teacher-evaluation-save-failed');
-
-      const nextRatings = { ...savedTeacherRatings, [key]: rating };
-      setSavedTeacherRatings(nextRatings);
-      setSavedTeacherNotes((current) => ({ ...current, [key]: teacherRatingNotes[key]?.trim() ?? '' }));
-      const pendingCount = teachers.reduce((total, currentTeacher) => (
-        total + currentTeacher.subjects.filter((currentSubject) => (
-          nextRatings[getTeacherRatingKey(currentTeacher.id, currentSubject)] === undefined
-        )).length
-      ), 0);
-      setTeacherEvaluationRequired(pendingCount > 0);
-      setTeacherRatingNotice(pendingCount === 0 ? 'شكرًا، اكتملت جميع التقييمات.' : 'تم حفظ التقييم. أكمل تقييم بقية المقررات.');
-      if (pendingCount === 0) setActiveTab('record');
-    } catch {
-      setTeacherRatingNotice('تعذر حفظ التقييم. شغّل تحديث SQL وتحقق من سياسات جدول تقييم المدرسين.');
-    } finally {
-      setSavingTeacherRatingKey(null);
-    }
-  };
 
   useEffect(() => {
     if (profileCompletion < 100) {
@@ -1502,7 +1302,7 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identifier: resetIdentifier, code: resetCode, newPassword }),
       });
-      const result = await response.json() as { success?: boolean; error?: string };
+      const result = await response.json() as { success?: boolean; error?: string; databaseCode?: string; databaseConstraint?: string };
       if (!result.success) {
         setToast({ message: resetErrorMessage(result.error), type: 'error' });
         return;
@@ -1641,6 +1441,56 @@ export default function Home() {
       setToast({ message: 'تعذر الاتصال بخدمة تغيير الرقم الجامعي.', type: 'error' });
     } finally {
       setIsChangingStudentId(false);
+    }
+  };
+
+  const submitStudentFeedback = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const studentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+    const password = String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? '');
+    if (!studentId || !password) {
+      setFeedbackMessage('تعذر التحقق من بيانات حسابك. يرجى تسجيل الخروج ثم الدخول مجدداً.');
+      return;
+    }
+    setFeedbackSubmitting(true);
+    setFeedbackMessage('');
+    try {
+      const response = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'submit',
+          studentId,
+          password,
+          kind: feedbackDraft.kind,
+          category: feedbackDraft.category,
+          details: feedbackDraft.details,
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string; databaseCode?: string };
+      if (!response.ok || !result.success) {
+        const messages: Record<string, string> = {
+          'student-credentials-invalid': 'تعذر التحقق من بيانات حسابك. يرجى تسجيل الخروج ثم الدخول مجدداً.',
+          'invalid-submission': 'يرجى مراجعة نوع الرسالة والتصنيف والتفاصيل.',
+          'feedback-table-not-found': 'جدول الشكاوى غير موجود في Supabase. شغّل ملف supabase-student-feedback.sql من محرر SQL ثم أعد المحاولة.',
+          'feedback-schema-out-of-date': 'مخطط جدول الشكاوى غير محدث. أعد تشغيل ملف supabase-student-feedback.sql في محرر SQL.',
+          'feedback-write-permission-denied': 'صلاحيات الكتابة على جدول الشكاوى غير مفعلة. أعد تشغيل ملف supabase-student-feedback.sql وتأكد من إعداد SUPABASE_SERVICE_ROLE_KEY.',
+          'feedback-check-constraint-failed': `قاعدة البيانات ما زالت ترفض الرسالة بسبب قيد قديم${result.databaseConstraint ? ` (${result.databaseConstraint})` : ''}. شغّل النسخة الحالية من supabase-student-feedback.sql على نفس مشروع Supabase.`,
+          'feedback-field-too-long': 'أحد الحقول يتجاوز الطول المسموح. اختصر التفاصيل وحاول مجددًا.',
+          'feedback-required-field-missing': 'بيانات الطالب المطلوبة غير مكتملة. يرجى مراجعة حسابك مع إدارة المعهد.',
+        };
+        const fallbackMessage = result.databaseCode
+          ? `تعذر الحفظ في قاعدة البيانات (رمز ${result.databaseCode}${result.databaseConstraint ? `، القيد ${result.databaseConstraint}` : ''}). أرسل الرمز لمسؤول النظام لمعرفة السبب.`
+          : 'تعذر إرسال رسالتك حالياً. حاول مرة أخرى لاحقاً.';
+        setFeedbackMessage(messages[result.error ?? ''] ?? fallbackMessage);
+        return;
+      }
+      setFeedbackDraft((current) => ({ ...current, details: '' }));
+      setFeedbackMessage('تم إرسال رسالتك بنجاح. شكراً لمشاركتك.');
+    } catch {
+      setFeedbackMessage('تعذر الاتصال بالخادم. حاول مرة أخرى لاحقاً.');
+    } finally {
+      setFeedbackSubmitting(false);
     }
   };
 
@@ -1854,7 +1704,7 @@ export default function Home() {
   return (
     <main className="student-shell" dir="rtl">
       <div className="student-page">
-        <div ref={studentDashboardRef} className="container student-dashboard-container" id="mainContainer" aria-hidden={teacherEvaluationGateOpen}>
+        <div className="container student-dashboard-container" id="mainContainer">
           <div className="student-brand-center student-identity-hero">
             <img
               className="institute-logo"
@@ -2583,6 +2433,82 @@ export default function Home() {
 
           </div>
 
+          <section style={{ marginTop: 22, padding: 20, border: '1px solid #dbe3ec', borderRadius: 16, background: '#fff' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 19, color: '#0f172a' }}>شاركنا رأيك</h2>
+                <p style={{ margin: '6px 0 0', color: '#64748b', fontSize: 14 }}>يمكنك إرسال شكوى أو اقتراح إلى إدارة المعهد.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowFeedbackForm((current) => !current);
+                  setFeedbackMessage('');
+                }}
+                aria-expanded={showFeedbackForm}
+                style={{ padding: '10px 16px', border: 0, borderRadius: 9, background: '#0f766e', color: '#fff', font: 'inherit', fontWeight: 700, cursor: 'pointer' }}
+              >
+                {showFeedbackForm ? 'إغلاق النموذج' : 'إرسال شكوى أو اقتراح'}
+              </button>
+            </div>
+            {showFeedbackForm && (
+              <form onSubmit={submitStudentFeedback} style={{ display: 'grid', gap: 12, marginTop: 18 }}>
+                <label style={{ display: 'grid', gap: 6 }}>
+                  <span>نوع الرسالة</span>
+                  <select
+                    value={feedbackDraft.kind}
+                    disabled={feedbackSubmitting}
+                    onChange={(event) => {
+                      const kind = event.target.value as 'complaint' | 'suggestion';
+                      setFeedbackDraft({ kind, category: kind === 'complaint' ? 'مدرس' : 'البوابة', details: feedbackDraft.details });
+                      setFeedbackMessage('');
+                    }}
+                    style={{ minHeight: 42, padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#0f172a', font: 'inherit' }}
+                  >
+                    <option value="complaint">شكوى</option>
+                    <option value="suggestion">اقتراح</option>
+                  </select>
+                </label>
+                <label style={{ display: 'grid', gap: 6 }}>
+                  <span>{feedbackDraft.kind === 'complaint' ? 'موضوع الشكوى' : 'الجهة المعنية بالاقتراح'}</span>
+                  <select
+                    value={feedbackDraft.category}
+                    disabled={feedbackSubmitting}
+                    onChange={(event) => setFeedbackDraft((current) => ({ ...current, category: event.target.value }))}
+                    style={{ minHeight: 42, padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#0f172a', font: 'inherit' }}
+                  >
+                    {(feedbackDraft.kind === 'complaint' ? ['مدرس', 'طالب', 'أخرى'] : ['البوابة', 'المعهد', 'أخرى']).map((category) => (
+                      <option key={category} value={category}>{category}</option>
+                    ))}
+                  </select>
+                </label>
+                <label style={{ display: 'grid', gap: 6 }}>
+                  <span>التفاصيل</span>
+                  <textarea
+                    required
+                    minLength={1}
+                    maxLength={3000}
+                    rows={6}
+                    value={feedbackDraft.details}
+                    disabled={feedbackSubmitting}
+                    onChange={(event) => setFeedbackDraft((current) => ({ ...current, details: event.target.value }))}
+                    placeholder="اكتب تفاصيل الشكوى أو الاقتراح..."
+                    style={{ width: '100%', boxSizing: 'border-box', padding: 12, border: '1px solid #cbd5e1', borderRadius: 8, resize: 'vertical', color: '#0f172a', font: 'inherit', lineHeight: 1.7 }}
+                  />
+                  <small style={{ color: '#64748b' }}>{feedbackDraft.details.length} / 3000</small>
+                </label>
+                {feedbackMessage && <p role="status" style={{ margin: 0, color: feedbackMessage.startsWith('تم ') ? '#047857' : '#b91c1c' }}>{feedbackMessage}</p>}
+                <button
+                  type="submit"
+                  disabled={feedbackSubmitting || !feedbackDraft.details.trim()}
+                  style={{ justifySelf: 'start', padding: '10px 18px', border: 0, borderRadius: 9, background: feedbackSubmitting || !feedbackDraft.details.trim() ? '#94a3b8' : '#0f766e', color: '#fff', font: 'inherit', fontWeight: 700, cursor: feedbackSubmitting || !feedbackDraft.details.trim() ? 'not-allowed' : 'pointer' }}
+                >
+                  {feedbackSubmitting ? 'جارٍ الإرسال...' : 'إرسال'}
+                </button>
+              </form>
+            )}
+          </section>
+
           <div className="last-updated">آخر تحديث للنظام: {formatDate(loggedStudent?.['تاريخ_تغيير_الفئة'])}</div>
 
           <div className="student-footer-actions">
@@ -2590,96 +2516,6 @@ export default function Home() {
           </div>
         </div>
 
-        {teacherEvaluationGateOpen && (
-          <div className="teacher-evaluation-gate-backdrop">
-            <section className="teacher-evaluation-gate" role="dialog" aria-modal="true" aria-labelledby="teacher-evaluation-gate-title">
-              <header className="teacher-evaluation-gate-header">
-                <span className="teacher-evaluation-kicker">إجراء مطلوب قبل متابعة حسابك</span>
-                <h2 id="teacher-evaluation-gate-title">تقييم المدرسين</h2>
-                <p>يرجى تقييم كل مدرس في المقررات التي شرحها. لن تتمكن من استخدام صفحة الطالب قبل حفظ جميع التقييمات.</p>
-                {teacherEvaluationReady && !teacherEvaluationError && teacherEvaluationTasks.length > 0 && (
-                  <div className="teacher-evaluation-progress" role="status">
-                    اكتمل {teacherEvaluationTasks.length - pendingTeacherEvaluationCount} من {teacherEvaluationTasks.length} مقررات
-                  </div>
-                )}
-              </header>
-
-              <div className="teacher-evaluation-gate-content">
-                {!teacherEvaluationReady || teacherEvaluationLoading ? (
-                  <div className="teacher-evaluation-gate-status" role="status">جارٍ تحميل المدرسين ومقرراتهم...</div>
-                ) : teacherEvaluationError ? (
-                  <div className="teacher-evaluation-gate-error" role="alert">
-                    <p>{teacherEvaluationError}</p>
-                    <button type="button" className="logout-button" onClick={logout}>تسجيل الخروج</button>
-                  </div>
-                ) : (
-                  <div className="teacher-evaluation-gate-list">
-                    {teachers.map((teacher) => (
-                      <article className="teacher-evaluation-gate-teacher" key={teacher.id}>
-                        <h3>{teacher.name}</h3>
-                        {teacher.subjects.map((subject) => {
-                          const key = getTeacherRatingKey(teacher.id, subject);
-                          const selectedRating = teacherRatingDrafts[key];
-                          const savedRating = savedTeacherRatings[key];
-                          const currentNote = teacherRatingNotes[key] ?? '';
-                          const savedNote = savedTeacherNotes[key] ?? '';
-                          const isSaving = savingTeacherRatingKey === key;
-                          const unchanged = savedRating === selectedRating && savedNote === currentNote;
-
-                          return (
-                            <div className="teacher-evaluation-gate-subject" key={key}>
-                              <div className="teacher-evaluation-gate-subject-title">
-                                <strong>{subject}</strong>
-                                {savedRating !== undefined && <span>تم الحفظ</span>}
-                              </div>
-                              <div className="teacher-rating-options" role="group" aria-label={`تقييم ${teacher.name} في ${subject}`}>
-                                {teacherRatingOptions.map((option) => (
-                                  <button
-                                    type="button"
-                                    key={option.value}
-                                    className={selectedRating === option.value ? 'is-selected' : ''}
-                                    aria-pressed={selectedRating === option.value}
-                                    onClick={() => setTeacherRatingDrafts((current) => ({ ...current, [key]: option.value }))}
-                                  >
-                                    {option.label}
-                                  </button>
-                                ))}
-                              </div>
-                              <label className="teacher-evaluation-note">
-                                <span>ملاحظة (اختياري)</span>
-                                <textarea
-                                  value={currentNote}
-                                  maxLength={1000}
-                                  rows={2}
-                                  onChange={(event) => setTeacherRatingNotes((current) => ({ ...current, [key]: event.target.value }))}
-                                  placeholder="اكتب ملاحظتك عن شرح المقرر"
-                                />
-                              </label>
-                              <button
-                                type="button"
-                                className="teacher-rating-save"
-                                disabled={selectedRating === undefined || isSaving || unchanged}
-                                onClick={() => void saveTeacherRating(teacher, subject)}
-                              >
-                                {isSaving ? 'جارٍ الحفظ...' : savedRating !== undefined ? 'تحديث التقييم' : 'حفظ التقييم'}
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </article>
-                    ))}
-                  </div>
-                )}
-                {teacherRatingNotice && <p className="teacher-evaluation-gate-notice" role="status">{teacherRatingNotice}</p>}
-              </div>
-
-              <footer className="teacher-evaluation-confidentiality">
-                <strong>تقييماتك سرية للغاية، لا داعي للقلق.</strong>
-                <span>لن تظهر للطلاب الآخرين، ويمكن للمشرفين المخوّلين الاطلاع عليها لتحسين العملية التعليمية.</span>
-              </footer>
-            </section>
-          </div>
-        )}
       </div>
     </main>
   );
