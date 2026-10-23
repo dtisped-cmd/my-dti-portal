@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { BrowserMultiFormatReader } from '@zxing/browser';
 import { Code2, Download, Pencil, Settings, X } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { writeAuditLog } from '../lib/auditLog';
@@ -15,7 +16,7 @@ import {
   StudentRow,
 } from '../lib/studentData';
 
-type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills';
+type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills' | 'attendance';
 
 type StudentSkill = {
   category: string;
@@ -241,6 +242,15 @@ export default function Home() {
   const [isExportingQr, setIsExportingQr] = useState(false);
   const [qrExportError, setQrExportError] = useState('');
   const [studentStatus, setStudentStatus] = useState<string>('غير متوفر');
+  const [attendanceCheckInBusy, setAttendanceCheckInBusy] = useState(false);
+  const [attendanceListening, setAttendanceListening] = useState(false);
+  const [attendanceCheckInStatus, setAttendanceCheckInStatus] = useState('');
+  const [attendanceQrScannerOpen, setAttendanceQrScannerOpen] = useState(false);
+  const [attendanceQrScannerError, setAttendanceQrScannerError] = useState('');
+  const attendanceQrVideoRef = useRef<HTMLVideoElement | null>(null);
+  const attendanceQrControlsRef = useRef<{ stop: () => void } | null>(null);
+  const attendanceListenerCleanupRef = useRef<(() => void) | null>(null);
+  const attendanceCheckInInProgressRef = useRef(false);
   const [classOptions, setClassOptions] = useState<Array<{ name: string; capacity: number | null; occupied: number; available: number | null }>>([]);
   const [selectedClassForUpdate, setSelectedClassForUpdate] = useState('');
   const [isChangingClass, setIsChangingClass] = useState(false);
@@ -599,9 +609,168 @@ export default function Home() {
     { key: 'grades', label: 'العلامات' },
     { key: 'record', label: 'السجل' },
     { key: 'status', label: 'الحالة' },
+    { key: 'attendance', label: 'تسجيل الحضور' },
     ...(hasStudentGroup ? [{ key: 'schedule' as const, label: 'برنامج الدوام' }] : []),
     { key: 'skills', label: 'مهاراتي' },
   ];
+
+  const submitAttendanceCheckIn = useCallback(async (
+    source: 'audio' | 'qr',
+    challengeToken?: string,
+    audioFrequencyHz?: number,
+  ) => {
+    if (!loggedStudent || attendanceCheckInInProgressRef.current) return;
+    const studentId = String(loggedStudent['الرقم الجامعي'] ?? '').trim();
+    const password = String(getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? '');
+    if (!studentId || !password) {
+      setAttendanceCheckInStatus('تعذر التحقق من حساب الطالب. سجّل الخروج ثم ادخل مجددًا.');
+      return;
+    }
+
+    attendanceCheckInInProgressRef.current = true;
+    setAttendanceCheckInBusy(true);
+    setAttendanceCheckInStatus('جارٍ التحقق من جلسة الحضور...');
+    try {
+      const response = await fetch('/api/student/attendance/check-in', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ studentId, password, source, challengeToken, audioFrequencyHz }),
+      });
+      const result = await response.json() as { success?: boolean; alreadyPresent?: boolean; course?: string; error?: string };
+      if (!response.ok || !result.success) {
+        const message = result.error === 'attendance-challenge-expired-or-not-found'
+          ? 'لم يتم العثور على جلسة حضور صالحة لهذه الفئة، أو انتهت صلاحية الرمز.'
+          : result.error === 'student-class-not-found'
+            ? 'لا توجد سنة دراسية أو فئة مسجلة في حسابك.'
+            : result.error === 'student-credentials-invalid'
+              ? 'تعذر التحقق من حساب الطالب. سجّل الخروج ثم ادخل مجددًا.'
+              : 'تعذر تسجيل الحضور الآن. حاول مجددًا أو استخدم QR.';
+        setAttendanceCheckInStatus(message);
+        return;
+      }
+      setAttendanceCheckInStatus(result.alreadyPresent
+        ? 'حضورك مسجل مسبقًا لهذه المادة اليوم.'
+        : `تم تسجيل حضورك${result.course ? ` لمادة ${result.course}` : ''} بنجاح.`);
+      attendanceListenerCleanupRef.current?.();
+    } catch (error) {
+      console.error('Student attendance check-in request failed:', error);
+      setAttendanceCheckInStatus('تعذر الاتصال بالخادم. تحقق من اتصال الإنترنت ثم أعد المحاولة.');
+    } finally {
+      attendanceCheckInInProgressRef.current = false;
+      setAttendanceCheckInBusy(false);
+    }
+  }, [loggedStudent]);
+
+  const startAttendanceListening = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setAttendanceCheckInStatus('هذا المتصفح لا يدعم الميكروفون. استخدم خيار QR البديل.');
+      return;
+    }
+    const AudioConstructor = window.AudioContext
+      || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioConstructor) {
+      setAttendanceCheckInStatus('هذا المتصفح لا يدعم الاستماع الصوتي. استخدم خيار QR البديل.');
+      return;
+    }
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
+    } catch (error) {
+      console.error('Student attendance microphone permission failed:', error);
+      setAttendanceCheckInStatus('لم يتم السماح باستخدام الميكروفون. اسمح به أو استخدم QR البديل.');
+      return;
+    }
+
+    const context = new AudioConstructor();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 4096;
+    context.createMediaStreamSource(stream).connect(analyser);
+    const spectrum = new Float32Array(analyser.frequencyBinCount);
+    const supportedFrequencies = [17000, 18000, 19000, 20000];
+    let consecutiveToneFrames = 0;
+    let detectedFrequencyHz = 0;
+    let lastCheckInAttemptAt = 0;
+    let isCleanedUp = false;
+    const cleanup = () => {
+      if (isCleanedUp) return;
+      isCleanedUp = true;
+      window.clearInterval(checkForTone);
+      stream.getTracks().forEach((track) => track.stop());
+      void context.close();
+      attendanceListenerCleanupRef.current = null;
+      setAttendanceListening(false);
+    };
+    const checkForTone = window.setInterval(() => {
+      analyser.getFloatFrequencyData(spectrum);
+      const strongestSignal = supportedFrequencies
+        .map((frequency) => {
+          const centerBin = Math.round(frequency / (context.sampleRate / analyser.fftSize));
+          return {
+            frequency,
+            strength: Math.max(spectrum[centerBin - 1] ?? -120, spectrum[centerBin] ?? -120, spectrum[centerBin + 1] ?? -120),
+          };
+        })
+        .sort((first, second) => second.strength - first.strength)[0];
+      consecutiveToneFrames = strongestSignal.strength > -48 ? consecutiveToneFrames + 1 : 0;
+      if (consecutiveToneFrames) detectedFrequencyHz = strongestSignal.frequency;
+      if (consecutiveToneFrames >= 3) {
+        const now = Date.now();
+        if (now - lastCheckInAttemptAt >= 5000 && !attendanceCheckInInProgressRef.current) {
+          lastCheckInAttemptAt = now;
+          setAttendanceCheckInStatus('تم التقاط النبضة. جارٍ التحقق من جلسة الحضور...');
+          void submitAttendanceCheckIn('audio', undefined, detectedFrequencyHz);
+        }
+      }
+    }, 55);
+
+    attendanceListenerCleanupRef.current = cleanup;
+    setAttendanceListening(true);
+    setAttendanceCheckInStatus('الميكروفون يعمل. أبقِ الصفحة مفتوحة قرب المشرف؛ سنستمع للنطاقات المدعومة حتى تسجيل حضورك.');
+  }, [submitAttendanceCheckIn]);
+
+  useEffect(() => () => {
+    attendanceListenerCleanupRef.current?.();
+    attendanceQrControlsRef.current?.stop();
+  }, []);
+
+  useEffect(() => {
+    if (!attendanceQrScannerOpen) return;
+    const video = attendanceQrVideoRef.current;
+    if (!video) return;
+    let cancelled = false;
+    const reader = new BrowserMultiFormatReader();
+    setAttendanceQrScannerError('');
+    void reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' } } }, video, (result) => {
+      if (!result || cancelled || attendanceCheckInInProgressRef.current) return;
+      const fields = result.getText().trim().split('|');
+      if (fields[0]?.toUpperCase() !== 'UDTI' || fields[1]?.toUpperCase() !== 'ATTEND' || !fields[4]) {
+        setAttendanceQrScannerError('هذا ليس رمز حضور صالحًا. امسح رمز الجلسة المعروض عند المشرف.');
+        return;
+      }
+      setAttendanceQrScannerOpen(false);
+      attendanceQrControlsRef.current?.stop();
+      attendanceQrControlsRef.current = null;
+      void submitAttendanceCheckIn('qr', fields[4]);
+    }).then((controls) => {
+      if (cancelled) {
+        controls.stop();
+        return;
+      }
+      attendanceQrControlsRef.current = controls;
+    }).catch((error) => {
+      if (cancelled) return;
+      console.error('Student attendance QR scanner failed:', error);
+      setAttendanceQrScannerError('تعذر تشغيل الكاميرا. اسمح للمتصفح باستخدامها أو جرّب مرة أخرى.');
+    });
+    return () => {
+      cancelled = true;
+      attendanceQrControlsRef.current?.stop();
+      attendanceQrControlsRef.current = null;
+    };
+  }, [attendanceQrScannerOpen, submitAttendanceCheckIn]);
 
   useEffect(() => {
     if (loggedStudent) {
@@ -2191,6 +2360,59 @@ export default function Home() {
                 </button>
               ))}
             </div>
+
+            {activeTab === 'attendance' && (
+              <div className="tab-content active">
+                <section className="student-attendance-checkin" style={{ display: 'grid', gap: 14, padding: 18, borderRadius: 14, background: '#f8fafc' }}>
+                  <div>
+                    <h2 style={{ margin: '0 0 8px' }}>تسجيل الحضور</h2>
+                    <p style={{ margin: 0, color: '#475569', lineHeight: 1.8 }}>
+                      ابدأ الاستماع واسمح باستخدام الميكروفون، ثم أبقِ هذه الصفحة مفتوحة قرب جهاز المشرف. إذا لم يلتقط هاتفك الإشارة، امسح QR المعروض في جلسة الحضور.
+                    </p>
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                    {!attendanceListening ? (
+                      <button type="button" className="action-button primary" onClick={() => void startAttendanceListening()} disabled={attendanceCheckInBusy}>
+                        الاستماع للموجة فوق الصوتية
+                      </button>
+                    ) : (
+                      <button type="button" className="action-button" onClick={() => attendanceListenerCleanupRef.current?.()}>
+                        إيقاف الاستماع
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="action-button"
+                      onClick={() => { setAttendanceQrScannerError(''); setAttendanceQrScannerOpen(true); }}
+                      disabled={attendanceCheckInBusy}
+                    >
+                      مسح QR بديل
+                    </button>
+                  </div>
+                  {attendanceCheckInStatus && <p role="status" aria-live="polite" style={{ margin: 0, color: '#0f172a' }}>{attendanceCheckInStatus}</p>}
+                  <small style={{ color: '#64748b', lineHeight: 1.7 }}>
+                    يتطلب الصوت إذن الميكروفون واتصالًا بالإنترنت. لا تُسجّل الصفحة صوتًا؛ يُستخدم تحليل محلي لاكتشاف النغمة فقط. قد لا تدعم بعض الأجهزة التردد العالي، لذلك يتوفر QR كبديل.
+                  </small>
+                </section>
+                {attendanceQrScannerOpen && (
+                  <div className="attendance-qr-scanner-backdrop">
+                    <section className="attendance-qr-scanner-dialog" role="dialog" aria-modal="true" aria-labelledby="student-attendance-qr-title">
+                      <div className="attendance-qr-scanner-heading">
+                        <div>
+                          <h2 id="student-attendance-qr-title">مسح رمز جلسة الحضور</h2>
+                          <p>وجّه الكاميرا إلى QR الذي يعرضه المشرف.</p>
+                        </div>
+                        <button type="button" className="attendance-qr-scanner-close" onClick={() => setAttendanceQrScannerOpen(false)}>
+                          إغلاق
+                        </button>
+                      </div>
+                      <video ref={attendanceQrVideoRef} className="attendance-qr-scanner-video" muted playsInline />
+                      {attendanceQrScannerError && <p className="attendance-qr-scanner-error" role="alert">{attendanceQrScannerError}</p>}
+                    </section>
+                  </div>
+                )}
+              </div>
+            )}
 
             {activeTab === 'grades' && (
               <div className="tab-content active">

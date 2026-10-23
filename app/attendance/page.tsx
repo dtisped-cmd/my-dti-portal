@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
+import QRCode from 'qrcode';
 import { CheckCircle2, ScanLine, UserRound, X } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { writeAuditLog } from '../../lib/auditLog';
@@ -73,6 +74,7 @@ type AttendanceEntry = {
   timestamp: string | null;
   year: string;
   absenceReason?: AbsenceReason | '';
+  saved?: boolean;
 };
 
 type PendingAttendanceJob = {
@@ -112,7 +114,7 @@ const tableCandidates = {
   students: ['students'],
   attendance: ['الحضور'],
   warnings: ['الإنذارات'],
-  sessions: ['جلسات الحضور'],
+  sessions: [encodeURIComponent('جلسات الحضور')],
   supervisorWarnings: ['إنذارات المشرفين'],
 };
 
@@ -762,7 +764,7 @@ const closeExpiredAttendanceSessions = async () => {
   if (error && !isMissingSessionTableError(error)) console.error('Expired session cleanup failed:', error.message);
 };
 
-const createAttendanceSession = async (course: string, classValue: string, supervisor: string) => {
+const createAttendanceSession = async (course: string, classValue: string, supervisor: string, year: string) => {
   const session: RecentAttendanceSession = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     course,
@@ -779,11 +781,12 @@ const createAttendanceSession = async (course: string, classValue: string, super
     المادة: session.course,
     الفئة: session.classValue,
     المشرف: session.supervisor,
+    student_year: year,
     started_at: session.startedAt,
     الحالة: 'نشطة',
   }]);
 
-  if (error && !isMissingSessionTableError(error)) return { session: null, error };
+  if (error) return { session: null, error };
   return { session, error: null };
 };
 
@@ -1055,11 +1058,18 @@ export default function AttendancePage() {
   const [qrScannerError, setQrScannerError] = useState('');
   const [qrScanSuccess, setQrScanSuccess] = useState(false);
   const [scannedStudentName, setScannedStudentName] = useState('');
+  const [attendanceChallengeQr, setAttendanceChallengeQr] = useState('');
+  const [attendanceChallengeQrImage, setAttendanceChallengeQrImage] = useState('');
+  const [showAttendanceChallengeQr, setShowAttendanceChallengeQr] = useState(false);
+  const [audioChallengeBusy, setAudioChallengeBusy] = useState(false);
+  const [audioChallengeStatus, setAudioChallengeStatus] = useState('');
+  const [attendanceToneFrequency, setAttendanceToneFrequency] = useState(19000);
   const qrVideoRef = useRef<HTMLVideoElement | null>(null);
   const qrScannerControlsRef = useRef<{ stop: () => void } | null>(null);
   const qrScanHandlerRef = useRef<(rawValue: string) => void>(() => undefined);
   const scannedQrStudentIdsRef = useRef<Set<string>>(new Set());
   const qrScanSuccessTimerRef = useRef<number | null>(null);
+  const attendanceToneCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (!selectedAttendancePhoto) return;
@@ -1069,6 +1079,22 @@ export default function AttendancePage() {
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
   }, [selectedAttendancePhoto]);
+  useEffect(() => {
+    if (!attendanceChallengeQr) {
+      setAttendanceChallengeQrImage('');
+      return;
+    }
+    let cancelled = false;
+    void QRCode.toDataURL(attendanceChallengeQr, { width: 260, margin: 2 })
+      .then((image) => {
+        if (!cancelled) setAttendanceChallengeQrImage(image);
+      })
+      .catch((error: unknown) => {
+        console.error('Attendance QR generation failed:', error);
+        if (!cancelled) setAudioChallengeStatus('تعذر إنشاء QR البديل على هذا الجهاز.');
+      });
+    return () => { cancelled = true; };
+  }, [attendanceChallengeQr]);
   const [supervisorLoggedIn, setSupervisorLoggedIn] = useState(false);
   const [supervisorSessionReady, setSupervisorSessionReady] = useState(false);
   const [supervisorUsername, setSupervisorUsername] = useState<string>('');
@@ -1233,6 +1259,66 @@ export default function AttendancePage() {
       setSupervisorSessionReady(true);
     }
   }, []);
+
+  useEffect(() => {
+    if (!sessionActive || !selectedCourse || !selectedClass || !students.length) return;
+    let cancelled = false;
+    let loadingCheckIns = false;
+
+    const refreshStudentCheckIns = async () => {
+      if (loadingCheckIns) return;
+      loadingCheckIns = true;
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const { data, error } = await supabase.from(tableCandidates.attendance[0]).select('*')
+          .eq('المادة', selectedCourse)
+          .eq('الفئة', selectedClass)
+          .eq('التاريخ', today);
+        if (error) throw error;
+        if (cancelled || !Array.isArray(data)) return;
+
+        const presentByStudent = new Map<string, string>();
+        const sessionStudentIds = new Set(students.map(getStudentIdentifier).filter(Boolean));
+        (data as Record<string, unknown>[]).forEach((record) => {
+          const studentId = String(record['الرقم الجامعي'] ?? record.student_id ?? '').trim();
+          const status = String(record['الحالة'] ?? record.status ?? '').trim();
+          if (sessionStudentIds.has(studentId) && ['حاضر', 'present'].includes(status)) {
+            presentByStudent.set(studentId, String(record['الوقت'] ?? ''));
+          }
+        });
+        if (!presentByStudent.size) return;
+
+        setAttendanceData((current) => {
+          const next = { ...current };
+          presentByStudent.forEach((timestamp, studentId) => {
+            if (next[studentId]?.status !== 'pending') return;
+            const student = students.find((row) => getStudentIdentifier(row) === studentId);
+            if (!student) return;
+            next[studentId] = {
+              id: studentId,
+              name: getFullStudentName(student),
+              status: 'present',
+              timestamp: timestamp || new Date().toLocaleTimeString('ar-EG'),
+              year: normalizeText(student['السنه الدراسية']),
+              saved: true,
+            };
+          });
+          return next;
+        });
+      } catch (error) {
+        if (!cancelled) console.error('Student attendance check-in sync failed:', getSupabaseErrorText(error));
+      } finally {
+        loadingCheckIns = false;
+      }
+    };
+
+    void refreshStudentCheckIns();
+    const timer = window.setInterval(() => void refreshStudentCheckIns(), 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionActive, selectedCourse, selectedClass, students]);
 
   useEffect(() => {
     const syncPendingAttendance = async () => {
@@ -2456,7 +2542,7 @@ export default function AttendancePage() {
     let openedSessionId: string | null = null;
     try {
       const currentSessions = await loadRecentAttendanceSessions();
-      const created = await createAttendanceSession(selectedCourse, selectedClass, supervisorUsername);
+      const created = await createAttendanceSession(selectedCourse, selectedClass, supervisorUsername, selectedYear);
       if (created.error || !created.session) {
         const message = getSupabaseErrorText(created.error);
         const lowerMessage = message.toLowerCase();
@@ -2503,6 +2589,7 @@ export default function AttendancePage() {
       setAttendanceData(map);
       setSessionActive(true);
       setActiveSession(created.session);
+      await createAttendanceChallenge(created.session.id);
       setRecentSessions([created.session, ...currentSessions]);
       writeAuditLog({
         action: 'attendance_session_started',
@@ -2553,6 +2640,128 @@ export default function AttendancePage() {
       details: { studentId, studentName: getFullStudentName(student), status, absenceReason: normalizedReason || undefined, course: selectedCourse, classValue: selectedClass },
     });
   };
+
+  const createAttendanceChallenge = useCallback(async (
+    sessionId = activeSession?.id,
+    frequencyHz = attendanceToneFrequency,
+  ) => {
+    if (!sessionId) {
+      setAudioChallengeStatus('لا توجد جلسة حضور نشطة لنشر رمزها. ابدأ الجلسة أولاً.');
+      return '';
+    }
+    const tokenBytes = new Uint8Array(16);
+    window.crypto.getRandomValues(tokenBytes);
+    const token = Array.from(tokenBytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    const challengePayload = `UDTI|ATTEND|${selectedCourse}|${selectedClass}|${token}|${Date.now()}`;
+    const tokenDigest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+    const storedToken = Array.from(new Uint8Array(tokenDigest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    if (!supervisorUsername) {
+      setAudioChallengeStatus('تعذر التحقق من المشرف. سجّل الخروج ثم ادخل مجددًا.');
+      return '';
+    }
+
+    setAttendanceChallengeQr('');
+    setShowAttendanceChallengeQr(false);
+    try {
+      const response = await fetch('/api/attendance/challenge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId,
+          supervisorUsername,
+          tokenDigest: storedToken,
+          frequencyHz,
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string };
+      if (!response.ok || !result.success) {
+        console.error('Attendance challenge publish failed:', result.error || response.status);
+        setAudioChallengeStatus(result.error === 'attendance-challenge-server-key-missing'
+          ? 'إعداد الخادم ناقص: أضف SUPABASE_SERVICE_ROLE_KEY إلى متغيرات بيئة الخادم.'
+          : result.error === 'attendance-sessions-table-missing'
+            ? 'جدول جلسات الحضور غير موجود في قاعدة البيانات المتصلة. شغّل ملف supabase-attendance-sessions.sql في مشروع Supabase الصحيح.'
+          : result.error === 'attendance-challenge-supervisor-invalid'
+            ? 'انتهت صلاحية تسجيل دخول المشرف. سجّل الدخول مجددًا.'
+            : 'فشل نشر رمز الحضور إلى قاعدة البيانات. راجع اتصال الخادم بـ Supabase وحاول مرة أخرى.');
+        return '';
+      }
+    } catch (error) {
+      console.error('Attendance challenge publish request failed:', error);
+      setAudioChallengeStatus('تعذر الاتصال بخادم التطبيق لنشر الرمز. تحقق من اتصال الخادم ثم أعد المحاولة.');
+      return '';
+    }
+
+    setAttendanceChallengeQr(challengePayload);
+    setShowAttendanceChallengeQr(true);
+    setAudioChallengeStatus('تم نشر رمز الجلسة بنجاح. يمكن للطلاب استخدام الصوت أو QR البديل.');
+    return challengePayload;
+  }, [activeSession, attendanceToneFrequency, selectedClass, selectedCourse, supervisorUsername]);
+
+  const triggerAttendanceUltrasonicTone = useCallback(async (frequencyHz = attendanceToneFrequency) => {
+    if (typeof window === 'undefined') return;
+    if (attendanceToneCleanupRef.current) return;
+
+    const AudioConstructor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioConstructor) {
+      setAudioChallengeStatus('المتصفح الحالي لا يدعم تشغيل إشارات الموجات فوق الصوتية. استخدم رمز QR البديل.');
+      return;
+    }
+
+    const audioContext = new AudioConstructor();
+    try {
+      await audioContext.resume();
+    } catch (error) {
+      console.error('Attendance audio context could not start:', error);
+      await audioContext.close();
+      setAudioChallengeStatus('تعذر تشغيل الصوت على هذا الجهاز. استخدم QR البديل.');
+      return;
+    }
+    const challengePayload = await createAttendanceChallenge(activeSession?.id, frequencyHz);
+    if (!challengePayload) {
+      await audioContext.close();
+      setAudioChallengeStatus('تعذر تجهيز جلسة الحضور. أعد المحاولة أو استخدم التسجيل اليدوي.');
+      return;
+    }
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.type = 'sine';
+    oscillator.frequency.value = frequencyHz;
+    gainNode.gain.value = 0;
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    try {
+      oscillator.start();
+    } catch (error) {
+      console.error('Attendance tone playback failed:', error);
+      await audioContext.close();
+      setAudioChallengeStatus('تعذر تشغيل الإشارة الصوتية على هذا الجهاز. استخدم QR البديل.');
+      return;
+    }
+
+    let pulseOn = false;
+    const pulseTimer = window.setInterval(() => {
+      pulseOn = !pulseOn;
+      const now = audioContext.currentTime;
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setTargetAtTime(pulseOn ? 0.025 : 0, now, 0.025);
+    }, 900);
+    const renewalTimer = window.setInterval(() => {
+      void createAttendanceChallenge(activeSession?.id, frequencyHz);
+    }, 60_000);
+    const cleanup = () => {
+      window.clearInterval(pulseTimer);
+      window.clearInterval(renewalTimer);
+      try { oscillator.stop(); } catch { /* oscillator may already be stopped */ }
+      void audioContext.close();
+      attendanceToneCleanupRef.current = null;
+      setAudioChallengeBusy(false);
+    };
+    attendanceToneCleanupRef.current = cleanup;
+    setAudioChallengeBusy(true);
+    setAudioChallengeStatus(`يتم تكرار النبض على تردد ${frequencyHz} هرتز حتى إيقافه. غيّر النطاق إذا لم تستجب الأجهزة.`);
+  }, [activeSession?.id, attendanceToneFrequency, createAttendanceChallenge]);
 
   const handleScannedStudentQr = (rawValue: string) => {
     const qrParts = rawValue.trim().split('|');
@@ -2624,6 +2833,7 @@ export default function AttendancePage() {
 
   useEffect(() => () => {
     if (qrScanSuccessTimerRef.current !== null) window.clearTimeout(qrScanSuccessTimerRef.current);
+    attendanceToneCleanupRef.current?.();
   }, []);
 
   const handleSendTelegramForStudent = async (student: StudentRow, messageText = 'تذكير بالحضور') => {
@@ -2776,11 +2986,15 @@ export default function AttendancePage() {
       return;
     }
 
+    attendanceToneCleanupRef.current?.();
     if (activeSession) void closeAttendanceSession(activeSession.id);
     setAttendanceData({});
     setStudents([]);
     setSessionActive(false);
     setActiveSession(null);
+    setAttendanceChallengeQr('');
+    setShowAttendanceChallengeQr(false);
+    setAudioChallengeStatus('');
     setNotice('تم إلغاء الجلسة بنجاح');
   };
 
@@ -2840,6 +3054,8 @@ export default function AttendancePage() {
           continue;
         }
 
+        if (entry.saved) continue;
+
         jobs.push({
           type: 'attendance',
           student,
@@ -2885,6 +3101,7 @@ export default function AttendancePage() {
         ? `تم حفظ ${savedRecords} سجل و${savedWarnings} إنذار، وتعذر حفظ ${failedJobs.length} عملية. ستتم إعادة المحاولة تلقائياً.`
         : `تم حفظ البيانات بنجاح: ${savedRecords} سجل حضور و ${savedWarnings} إنذار`);
       if (!failedJobs.length) {
+        attendanceToneCleanupRef.current?.();
         if (activeSession) await closeAttendanceSession(activeSession.id);
         setActiveSession(null);
         setSessionActive(false);
@@ -2922,6 +3139,7 @@ export default function AttendancePage() {
                 if (supervisorUsername) {
                   await refreshSupervisorSessionFromDatabase(supervisorUsername);
                 }
+                attendanceToneCleanupRef.current?.();
                 if (activeSession) void closeAttendanceSession(activeSession.id);
                 setSelectedFeature(null);
                 setSessionActive(false);
@@ -2973,6 +3191,7 @@ export default function AttendancePage() {
               type="button"
               className="back-link"
               onClick={() => {
+                attendanceToneCleanupRef.current?.();
                 if (activeSession) void closeAttendanceSession(activeSession.id);
                 writeAuditLog({ action: 'supervisor_logout', userType: 'supervisor', username: supervisorUsername });
                 window.localStorage.removeItem(supervisorSessionStorageKey);
@@ -3651,6 +3870,23 @@ export default function AttendancePage() {
               </div>
             </div>
 
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 18 }}>
+              <section className="session-info" style={{ margin: 0 }}>
+                <strong>سجلوا الحضور ({stats.present})</strong>
+                {students.filter((student) => attendanceData[getStudentIdentifier(student)]?.status === 'present').length
+                  ? students.filter((student) => attendanceData[getStudentIdentifier(student)]?.status === 'present')
+                    .map((student) => <div key={getStudentIdentifier(student)} style={{ marginTop: 5 }}>✓ {getFullStudentName(student)}</div>)
+                  : <div style={{ marginTop: 5 }}>لم يسجل أحد بعد.</div>}
+              </section>
+              <section className="session-info" style={{ margin: 0 }}>
+                <strong>لم يستجيبوا بعد ({stats.pending})</strong>
+                {students.filter((student) => attendanceData[getStudentIdentifier(student)]?.status === 'pending').length
+                  ? students.filter((student) => attendanceData[getStudentIdentifier(student)]?.status === 'pending')
+                    .map((student) => <div key={getStudentIdentifier(student)} style={{ marginTop: 5 }}>• {getFullStudentName(student)}</div>)
+                  : <div style={{ marginTop: 5 }}>تم تسجيل الجميع.</div>}
+              </section>
+            </div>
+
             <div className="admin-view-tabs">
               {([
                 ['all', 'الكل'],
@@ -4211,6 +4447,63 @@ export default function AttendancePage() {
                 <div className="stat-label">بانتظار التسجيل</div>
               </div>
             </div>
+
+            <div className="student-actions" style={{ marginBottom: 18, gap: 12, alignItems: 'center', justifyContent: 'flex-start', flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span>نطاق الموجة</span>
+                <select
+                  aria-label="تردد الموجة الصوتية"
+                  value={attendanceToneFrequency}
+                  onChange={(event) => {
+                    const nextFrequency = Number(event.target.value);
+                    setAttendanceToneFrequency(nextFrequency);
+                    if (audioChallengeBusy) {
+                      attendanceToneCleanupRef.current?.();
+                      window.setTimeout(() => void triggerAttendanceUltrasonicTone(nextFrequency), 0);
+                    }
+                  }}
+                >
+                  <option value={17000}>17 كيلوهرتز</option>
+                  <option value={18000}>18 كيلوهرتز</option>
+                  <option value={19000}>19 كيلوهرتز</option>
+                  <option value={20000}>20 كيلوهرتز</option>
+                </select>
+              </label>
+              {!audioChallengeBusy ? (
+                <button type="button" className="action-button primary" onClick={() => void triggerAttendanceUltrasonicTone()}>
+                  بدء تكرار النبضات
+                </button>
+              ) : (
+                <button type="button" className="action-button warning" onClick={() => attendanceToneCleanupRef.current?.()}>
+                  إيقاف النبضات
+                </button>
+              )}
+              <button type="button" className="action-button" onClick={() => createAttendanceChallenge()}>
+                QR بديل
+              </button>
+              {audioChallengeStatus && <span className="session-info" style={{ margin: 0 }}>{audioChallengeStatus}</span>}
+            </div>
+
+            {showAttendanceChallengeQr && attendanceChallengeQr && (
+              <div className="attendance-qr-scanner-backdrop" onClick={() => setShowAttendanceChallengeQr(false)}>
+                <section className="attendance-qr-scanner-dialog" role="dialog" aria-modal="true" aria-labelledby="attendance-attendance-challenge-title" onClick={(event) => event.stopPropagation()}>
+                  <div className="attendance-qr-scanner-heading">
+                    <div>
+                      <h2 id="attendance-attendance-challenge-title">QR بديل للحضور</h2>
+                      <p>صلاحية الرمز 90 ثانية. أعد إصداره إذا انتهت صلاحيته.</p>
+                    </div>
+                    <button type="button" className="attendance-qr-scanner-close" onClick={() => setShowAttendanceChallengeQr(false)} aria-label="إغلاق رمز QR البديل">
+                      إغلاق
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'center', padding: '12px 0 6px' }}>
+                    {attendanceChallengeQrImage
+                      ? <img src={attendanceChallengeQrImage} alt="رمز QR بديل للحضور" style={{ maxWidth: '260px', width: '100%', borderRadius: 12, background: 'white', padding: 8 }} />
+                      : <span>جارٍ إنشاء رمز QR...</span>}
+                  </div>
+                </section>
+              </div>
+            )}
 
             {showQrScanner && (
               <div className="attendance-qr-scanner-backdrop">
