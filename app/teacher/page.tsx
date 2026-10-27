@@ -43,14 +43,17 @@ type TeacherAlert = {
 
 const getAttendanceStatus = (status: string) => {
   const value = status.trim().toLowerCase();
-  if (value === 'حاضر' || value === 'present') return 'present';
-  if (value === 'غائب' || value === 'absent') return 'absent';
+  if (['حاضر', 'حضور', 'present'].includes(value)) return 'present';
+  if (['غائب', 'غياب', 'متغيب', 'absent'].includes(value)) return 'absent';
   return 'other';
 };
 
 const formatDate = (value: string) => {
   if (!value) return '—';
-  const date = new Date(value);
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const date = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('ar-SY');
 };
 

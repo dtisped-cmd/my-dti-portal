@@ -4,6 +4,7 @@ import { createSupabaseAdminClient } from '../../../../lib/supabaseAdmin';
 export const dynamic = 'force-dynamic';
 
 const clean = (value: unknown) => String(value ?? '').trim();
+const attendanceAudioFrequencies = [1000, 1500, 2000, 17000, 18000, 19000, 20000];
 const normalize = (value: unknown) => clean(value).replace(/\s+/g, '').toLocaleLowerCase();
 
 export async function POST(request: Request) {
@@ -25,7 +26,7 @@ export async function POST(request: Request) {
     const frequencyHz = Number(body.frequencyHz);
 
     if (!sessionId || !username || !/^[a-f\d]{64}$/i.test(tokenDigest)
-      || ![17000, 18000, 19000, 20000].includes(frequencyHz)) {
+      || !attendanceAudioFrequencies.includes(frequencyHz)) {
       return NextResponse.json({ success: false, error: 'attendance-challenge-invalid-request' }, { status: 400 });
     }
 

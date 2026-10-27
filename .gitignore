@@ -5,3 +5,6 @@ out
 npm-debug.log*
 .DS_Store
 *.log
+
+# Local Netlify folder
+.netlify

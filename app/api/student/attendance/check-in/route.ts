@@ -5,6 +5,7 @@ import { createSupabaseAdminClient } from '../../../../../lib/supabaseAdmin';
 export const dynamic = 'force-dynamic';
 
 const clean = (value: unknown) => String(value ?? '').trim();
+const attendanceAudioFrequencies = [1000, 1500, 2000, 17000, 18000, 19000, 20000];
 const normalizeGroup = (value: unknown) => clean(value).replace(/^فئة\s*/i, '');
 const normalizeYear = (value: unknown) => {
   const year = clean(value).replace(/\s+/g, '').toLocaleLowerCase();
@@ -34,7 +35,7 @@ export async function POST(request: Request) {
     if (!studentId || !password || !['audio', 'qr'].includes(String(source))) {
       return NextResponse.json({ success: false, error: 'attendance-check-in-invalid-request' }, { status: 400 });
     }
-    if (source === 'audio' && ![17000, 18000, 19000, 20000].includes(audioFrequencyHz)) {
+    if (source === 'audio' && !attendanceAudioFrequencies.includes(audioFrequencyHz)) {
       return NextResponse.json({ success: false, error: 'attendance-frequency-invalid' }, { status: 400 });
     }
     if (source === 'qr' && !challengeToken) {
@@ -83,25 +84,54 @@ export async function POST(request: Request) {
     const course = clean(session['المادة'] ?? session.course);
     const classValue = clean(session['الفئة'] ?? session.class);
     const date = new Date().toISOString().slice(0, 10);
-    const { data: existing, error: existingError } = await supabase.from('الحضور').select('الرقم الجامعي')
+    const { data: existing, error: existingError } = await supabase.from('الحضور').select('*')
       .eq('الرقم الجامعي', studentId).eq('المادة', course).eq('الفئة', classValue)
-      .eq('التاريخ', date).eq('الحالة', 'حاضر').limit(1);
-    if (existingError && !/column|not found|does not exist/i.test(existingError.message)) {
+      .eq('التاريخ', date).eq('session_id', clean(session.session_id));
+    if (existingError) {
+      console.error('STUDENT_ATTENDANCE_DUPLICATE_CHECK_FAILED:', existingError.message);
       return NextResponse.json({ success: false, error: 'attendance-duplicate-check-failed' }, { status: 500 });
     }
-    if (existing?.length) {
+    if (existing?.some((record) => ['حاضر', 'present'].includes(clean(record['الحالة'] ?? record.status).toLocaleLowerCase()))) {
+      return NextResponse.json({ success: true, alreadyPresent: true });
+    }
+
+    const attendanceTime = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    const absentRows = (existing ?? []).filter((record) => ['غائب', 'absent'].includes(
+      clean(record['الحالة'] ?? record.status).toLocaleLowerCase()
+    ));
+    if (absentRows.length) {
+      const { data: updatedRows, error: updateError } = await supabase.from('الحضور')
+        .update({
+          'الحالة': 'حاضر',
+          'الوقت': attendanceTime,
+          'المشرف': clean(session['المشرف'] ?? session.supervisor) || 'مشرف غير محدد',
+          session_id: clean(session.session_id),
+        })
+        .eq('الرقم الجامعي', studentId)
+        .eq('المادة', course)
+        .eq('الفئة', classValue)
+        .eq('التاريخ', date)
+        .eq('session_id', clean(session.session_id))
+        .in('الحالة', ['غائب', 'absent'])
+        .select('الرقم الجامعي');
+      if (updateError) {
+        console.error('STUDENT_ATTENDANCE_ABSENCE_UPDATE_FAILED:', updateError.message);
+        return NextResponse.json({ success: false, error: 'attendance-save-failed' }, { status: 500 });
+      }
+      if (updatedRows?.length) return NextResponse.json({ success: true, course, updatedAbsence: true });
       return NextResponse.json({ success: true, alreadyPresent: true });
     }
 
     const attendanceRecord = {
       'التاريخ': date,
-      'الوقت': new Date().toLocaleTimeString('en-GB', { hour12: false }),
+      'الوقت': attendanceTime,
       'الرقم الجامعي': studentId,
       'اسم الطالب': clean(student['اسم الطالب'] ?? student.name),
       'المادة': course,
       'الفئة': classValue,
       'الحالة': 'حاضر',
       'المشرف': clean(session['المشرف'] ?? session.supervisor) || 'مشرف غير محدد',
+      session_id: clean(session.session_id),
     };
     const { error: insertError } = await supabase.from('الحضور').insert([attendanceRecord]);
     if (insertError) {

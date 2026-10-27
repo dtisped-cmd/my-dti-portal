@@ -1,11 +1,13 @@
 'use client';
 
 import Link from 'next/link';
+import NextImage from 'next/image';
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader } from '@zxing/browser';
-import { Code2, Download, Pencil, Settings, X } from 'lucide-react';
+import { Bell, Code2, Download, MessageCircle, Pencil, Settings, X } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { writeAuditLog } from '../lib/auditLog';
+import StudentChat from './components/StudentChat';
 import {
   getStudentById,
   getTeacherAlertsForStudent,
@@ -16,7 +18,16 @@ import {
   StudentRow,
 } from '../lib/studentData';
 
-type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills' | 'attendance';
+type TabKey = 'grades' | 'record' | 'status' | 'schedule' | 'skills' | 'attendance' | 'chat';
+type StudentChatNotification = {
+  id: string;
+  student_id: string;
+  student_name: string;
+  message: string;
+  created_at: string;
+  attachment_name?: string | null;
+  avatar_url?: string | null;
+};
 
 type StudentSkill = {
   category: string;
@@ -78,7 +89,11 @@ const formatDate = (value: string | null | undefined) => {
   if (!value) return 'غير متوفر';
 
   try {
-    return new Date(value).toLocaleDateString('ar-EG', {
+    const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    const date = dateOnly
+      ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+      : new Date(value);
+    return date.toLocaleDateString('ar-EG', {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -243,14 +258,22 @@ export default function Home() {
   const [qrExportError, setQrExportError] = useState('');
   const [studentStatus, setStudentStatus] = useState<string>('غير متوفر');
   const [attendanceCheckInBusy, setAttendanceCheckInBusy] = useState(false);
+  const [studentChatAvailable, setStudentChatAvailable] = useState(false);
+  const [unreadChatMessages, setUnreadChatMessages] = useState<StudentChatNotification[]>([]);
+  const [chatNotificationOpen, setChatNotificationOpen] = useState(false);
+  const [selectedChatMessageId, setSelectedChatMessageId] = useState('');
+  const unreadChatMessageIdsRef = useRef<Set<string> | null>(null);
+  const soundedChatMessageIdsRef = useRef(new Set<string>());
   const [attendanceListening, setAttendanceListening] = useState(false);
   const [attendanceCheckInStatus, setAttendanceCheckInStatus] = useState('');
+  const [attendanceSignalLevel, setAttendanceSignalLevel] = useState(0);
   const [attendanceQrScannerOpen, setAttendanceQrScannerOpen] = useState(false);
   const [attendanceQrScannerError, setAttendanceQrScannerError] = useState('');
   const attendanceQrVideoRef = useRef<HTMLVideoElement | null>(null);
   const attendanceQrControlsRef = useRef<{ stop: () => void } | null>(null);
   const attendanceListenerCleanupRef = useRef<(() => void) | null>(null);
   const attendanceCheckInInProgressRef = useRef(false);
+  const attendanceStartInProgressRef = useRef(false);
   const [classOptions, setClassOptions] = useState<Array<{ name: string; capacity: number | null; occupied: number; available: number | null }>>([]);
   const [selectedClassForUpdate, setSelectedClassForUpdate] = useState('');
   const [isChangingClass, setIsChangingClass] = useState(false);
@@ -278,6 +301,13 @@ export default function Home() {
   const [newPassword, setNewPassword] = useState('');
   const [resetLoading, setResetLoading] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const studentChatStudentId = String(loggedStudent?.['الرقم الجامعي'] ?? '').trim();
+  const studentChatYear = loggedStudent
+    ? normalizeStudentYear(getRecordValue(loggedStudent as Record<string, unknown>, ['السنه الدراسية', 'السنة الدراسية', 'year', 'student_year']))
+    : '';
+  const studentChatPassword = String(loggedStudent
+    ? getRecordValue(loggedStudent as Record<string, unknown>, ['كلمة السر', 'password', 'pass']) ?? ''
+    : '');
   const hasStudentGroup = Boolean(getStudentGroup(loggedStudent as Record<string, unknown> | null));
   const getStudentNamePart = (keys: string[]) => keys
     .map((key) => String((loggedStudent as Record<string, unknown> | null)?.[key] ?? '').trim())
@@ -302,6 +332,18 @@ export default function Home() {
   );
   const missingProfileTasks = profileChecklist.filter((task) => !task.complete).map((task) => task.label);
 
+  const playIncomingChatSound = useCallback((messageIds: string[]) => {
+    const newMessageIds = messageIds.filter((id) => !soundedChatMessageIdsRef.current.has(id));
+    if (!newMessageIds.length) return;
+    newMessageIds.forEach((id) => soundedChatMessageIdsRef.current.add(id));
+    if (soundedChatMessageIdsRef.current.size > 400) {
+      soundedChatMessageIdsRef.current = new Set([...soundedChatMessageIdsRef.current].slice(-200));
+    }
+    if (!soundEnabled) return;
+    if (!playClickSound) initClickSound();
+    playClickSound?.();
+  }, [soundEnabled]);
+
   useEffect(() => {
     if (profileCompletion < 100) {
       setShowProfileCompletion(true);
@@ -311,6 +353,63 @@ export default function Home() {
     const hideCompletionMessage = window.setTimeout(() => setShowProfileCompletion(false), 2000);
     return () => window.clearTimeout(hideCompletionMessage);
   }, [profileCompletion]);
+
+  useEffect(() => {
+    if (!isLoggedIn || !studentChatStudentId || !studentChatPassword) {
+      setStudentChatAvailable(false);
+      setUnreadChatMessages([]);
+      setChatNotificationOpen(false);
+      unreadChatMessageIdsRef.current = null;
+      soundedChatMessageIdsRef.current.clear();
+      return;
+    }
+
+    let cancelled = false;
+    const refreshChatStatus = async () => {
+      try {
+        const response = await fetch('/api/student-chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({
+            action: 'student-status',
+            studentId: studentChatStudentId,
+            password: studentChatPassword,
+          }),
+        });
+        const result = await response.json() as {
+          success?: boolean;
+          isOpen?: boolean;
+          isBanned?: boolean;
+          unreadMessages?: StudentChatNotification[];
+        };
+        const available = response.ok && result.success === true && result.isOpen === true && result.isBanned !== true;
+        if (cancelled) return;
+        setStudentChatAvailable(available);
+        const unreadMessages = available ? result.unreadMessages ?? [] : [];
+        const currentIds = new Set(unreadMessages.map((message) => message.id));
+        const previousIds = unreadChatMessageIdsRef.current;
+        if (previousIds) {
+          playIncomingChatSound([...currentIds].filter((id) => !previousIds.has(id)));
+        }
+        unreadChatMessageIdsRef.current = currentIds;
+        setUnreadChatMessages(unreadMessages);
+        if (!available) setActiveTab((current) => current === 'chat' ? 'record' : current);
+      } catch {
+        if (cancelled) return;
+        setStudentChatAvailable(false);
+        setUnreadChatMessages([]);
+        setActiveTab((current) => current === 'chat' ? 'record' : current);
+      }
+    };
+
+    void refreshChatStatus();
+    const interval = window.setInterval(() => void refreshChatStatus(), 15000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [isLoggedIn, playIncomingChatSound, studentChatPassword, studentChatStudentId]);
 
   /* ============================================================
      Click Sound: تهيئة + تشغيل تلقائي عند أي ضغطة على زر/رابط
@@ -610,6 +709,7 @@ export default function Home() {
     { key: 'record', label: 'السجل' },
     { key: 'status', label: 'الحالة' },
     { key: 'attendance', label: 'تسجيل الحضور' },
+    ...(studentChatAvailable ? [{ key: 'chat' as const, label: 'دردشة الطلاب' }] : []),
     ...(hasStudentGroup ? [{ key: 'schedule' as const, label: 'برنامج الدوام' }] : []),
     { key: 'skills', label: 'مهاراتي' },
   ];
@@ -636,7 +736,13 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ studentId, password, source, challengeToken, audioFrequencyHz }),
       });
-      const result = await response.json() as { success?: boolean; alreadyPresent?: boolean; course?: string; error?: string };
+      const result = await response.json() as {
+        success?: boolean;
+        alreadyPresent?: boolean;
+        updatedAbsence?: boolean;
+        course?: string;
+        error?: string;
+      };
       if (!response.ok || !result.success) {
         const message = result.error === 'attendance-challenge-expired-or-not-found'
           ? 'لم يتم العثور على جلسة حضور صالحة لهذه الفئة، أو انتهت صلاحية الرمز.'
@@ -648,9 +754,11 @@ export default function Home() {
         setAttendanceCheckInStatus(message);
         return;
       }
-      setAttendanceCheckInStatus(result.alreadyPresent
-        ? 'حضورك مسجل مسبقًا لهذه المادة اليوم.'
-        : `تم تسجيل حضورك${result.course ? ` لمادة ${result.course}` : ''} بنجاح.`);
+      setAttendanceCheckInStatus(result.updatedAbsence
+        ? `تم تحديث حالتك من غائب إلى حاضر${result.course ? ` لمادة ${result.course}` : ''}.`
+        : result.alreadyPresent
+          ? 'حضورك مسجل مسبقًا لهذه المادة اليوم.'
+          : `تم تسجيل حضورك${result.course ? ` لمادة ${result.course}` : ''} بنجاح.`);
       attendanceListenerCleanupRef.current?.();
     } catch (error) {
       console.error('Student attendance check-in request failed:', error);
@@ -662,37 +770,43 @@ export default function Home() {
   }, [loggedStudent]);
 
   const startAttendanceListening = useCallback(async () => {
+    if (attendanceStartInProgressRef.current || attendanceListening) return;
     if (!navigator.mediaDevices?.getUserMedia) {
-      setAttendanceCheckInStatus('هذا المتصفح لا يدعم الميكروفون. استخدم خيار QR البديل.');
+      setAttendanceCheckInStatus('هذا المتصفح لا يدعم تسجيل الحضور من هذا الجهاز. استخدم مسح رمز QR.');
       return;
     }
     const AudioConstructor = window.AudioContext
       || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioConstructor) {
-      setAttendanceCheckInStatus('هذا المتصفح لا يدعم الاستماع الصوتي. استخدم خيار QR البديل.');
+      setAttendanceCheckInStatus('تعذر بدء تسجيل الحضور على هذا المتصفح. استخدم مسح رمز QR.');
       return;
     }
 
+    attendanceStartInProgressRef.current = true;
+    setAttendanceCheckInStatus('يرجى السماح باستخدام الميكروفون لبدء تسجيل الحضور.');
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
     } catch (error) {
+      attendanceStartInProgressRef.current = false;
       console.error('Student attendance microphone permission failed:', error);
-      setAttendanceCheckInStatus('لم يتم السماح باستخدام الميكروفون. اسمح به أو استخدم QR البديل.');
+      setAttendanceCheckInStatus('لم يتم السماح باستخدام الميكروفون. اسمح به ثم حاول مجددًا، أو استخدم مسح رمز QR.');
       return;
     }
 
+    attendanceStartInProgressRef.current = false;
     const context = new AudioConstructor();
     const analyser = context.createAnalyser();
     analyser.fftSize = 4096;
     context.createMediaStreamSource(stream).connect(analyser);
     const spectrum = new Float32Array(analyser.frequencyBinCount);
-    const supportedFrequencies = [17000, 18000, 19000, 20000];
+    const supportedFrequencies = [1000, 1500, 2000, 17000, 18000, 19000, 20000];
     let consecutiveToneFrames = 0;
     let detectedFrequencyHz = 0;
     let lastCheckInAttemptAt = 0;
+    let lastSignalUpdateAt = 0;
     let isCleanedUp = false;
     const cleanup = () => {
       if (isCleanedUp) return;
@@ -702,6 +816,7 @@ export default function Home() {
       void context.close();
       attendanceListenerCleanupRef.current = null;
       setAttendanceListening(false);
+      setAttendanceSignalLevel(0);
     };
     const checkForTone = window.setInterval(() => {
       analyser.getFloatFrequencyData(spectrum);
@@ -714,13 +829,23 @@ export default function Home() {
           };
         })
         .sort((first, second) => second.strength - first.strength)[0];
+      const signalLevel = Math.max(0, Math.min(1, (strongestSignal.strength + 90) / 55));
+      const now = Date.now();
+      if (now - lastSignalUpdateAt >= 120) {
+        lastSignalUpdateAt = now;
+        setAttendanceSignalLevel(signalLevel);
+        if (!attendanceCheckInInProgressRef.current) {
+          setAttendanceCheckInStatus(signalLevel >= 0.36
+            ? 'جاري قراءة الإشارة... أبقِ هاتفك قريبًا من هاتف المشرف.'
+            : 'يرجى الاقتراب من هاتف المشرف لتسجيل الحضور.');
+        }
+      }
       consecutiveToneFrames = strongestSignal.strength > -48 ? consecutiveToneFrames + 1 : 0;
       if (consecutiveToneFrames) detectedFrequencyHz = strongestSignal.frequency;
       if (consecutiveToneFrames >= 3) {
-        const now = Date.now();
         if (now - lastCheckInAttemptAt >= 5000 && !attendanceCheckInInProgressRef.current) {
           lastCheckInAttemptAt = now;
-          setAttendanceCheckInStatus('تم التقاط النبضة. جارٍ التحقق من جلسة الحضور...');
+          setAttendanceCheckInStatus('تم العثور على هاتف المشرف. جارٍ تسجيل الحضور...');
           void submitAttendanceCheckIn('audio', undefined, detectedFrequencyHz);
         }
       }
@@ -728,8 +853,9 @@ export default function Home() {
 
     attendanceListenerCleanupRef.current = cleanup;
     setAttendanceListening(true);
-    setAttendanceCheckInStatus('الميكروفون يعمل. أبقِ الصفحة مفتوحة قرب المشرف؛ سنستمع للنطاقات المدعومة حتى تسجيل حضورك.');
-  }, [submitAttendanceCheckIn]);
+    setAttendanceSignalLevel(0);
+    setAttendanceCheckInStatus('يرجى الاقتراب من هاتف المشرف لتسجيل الحضور.');
+  }, [attendanceListening, submitAttendanceCheckIn]);
 
   useEffect(() => () => {
     attendanceListenerCleanupRef.current?.();
@@ -1674,6 +1800,7 @@ export default function Home() {
     window.localStorage.removeItem(studentSessionStorageKey);
     setIsLoggedIn(false);
     setLoggedStudent(null);
+    setStudentChatAvailable(false);
     setStudentSkills([]);
     setSkillDrafts([]);
     setIsEditingSkills(false);
@@ -1872,6 +1999,69 @@ export default function Home() {
 
   return (
     <main className="student-shell" dir="rtl">
+      {studentChatAvailable && unreadChatMessages.length > 0 && (
+        <div className="student-chat-notifications">
+          <button
+            type="button"
+            className="student-chat-notification-trigger"
+            aria-expanded={chatNotificationOpen}
+            aria-controls="student-chat-notification-panel"
+            onClick={() => setChatNotificationOpen((open) => !open)}
+          >
+            <Bell size={20} aria-hidden="true" />
+            <span>رسائل جديدة</span>
+            <strong>{unreadChatMessages.length}</strong>
+          </button>
+          {chatNotificationOpen && (
+            <section id="student-chat-notification-panel" className="student-chat-notification-panel" aria-label="الرسائل غير المقروءة">
+              <header>
+                <div>
+                  <strong>الرسائل غير المقروءة</strong>
+                  <span>{unreadChatMessages.length} رسالة بانتظارك</span>
+                </div>
+                <button type="button" aria-label="إغلاق الإشعارات" onClick={() => setChatNotificationOpen(false)}>
+                  <X size={18} aria-hidden="true" />
+                </button>
+              </header>
+              <div className="student-chat-notification-list">
+                {unreadChatMessages.slice(-10).reverse().map((message) => (
+                  <button
+                    type="button"
+                    className="student-chat-notification-item"
+                    key={message.id}
+                    onClick={() => {
+                      setSelectedChatMessageId(message.id);
+                      setActiveTab('chat');
+                      setChatNotificationOpen(false);
+                    }}
+                  >
+                    <span className="student-chat-notification-avatar" aria-hidden="true">
+                      {message.avatar_url
+                        ? <NextImage src={message.avatar_url} width={38} height={38} unoptimized alt="" />
+                        : message.student_name.charAt(0)}
+                    </span>
+                    <span className="student-chat-notification-content">
+                      <strong>{message.student_name}</strong>
+                      <span>{message.message || (message.attachment_name ? 'أرسل صورة أو مرفقًا' : 'رسالة جديدة')}</span>
+                    </span>
+                    <MessageCircle size={17} aria-hidden="true" />
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="student-chat-notification-open-all"
+                onClick={() => {
+                  setActiveTab('chat');
+                  setChatNotificationOpen(false);
+                }}
+              >
+                فتح الدردشة
+              </button>
+            </section>
+          )}
+        </div>
+      )}
       <div className="student-page">
         <div className="container student-dashboard-container" id="mainContainer">
           <div className="student-brand-center student-identity-hero">
@@ -2136,6 +2326,29 @@ export default function Home() {
             <div className="info-item"><span className="info-label"><i className="fa-solid fa-check-circle" /> السنة الدراسية</span> {formatStudentValue(loggedStudent?.['السنه الدراسية'])}</div>
           </div>
 
+          <section className="student-community-links" aria-label="روابط مجتمع المعهد">
+            <h2>مجتمع المعهد</h2>
+            <p>تابع أخبار المعهد وتواصل مع زملائك عبر قنواتنا الرسمية.</p>
+            <div className="student-community-link-list">
+              <a href="https://chat.whatsapp.com/FBWPC6rBRQC4koz4cq3fuG" target="_blank" rel="noreferrer">
+                <span aria-hidden="true">◉</span>
+                الانضمام إلى مجتمع واتساب
+              </a>
+              <a href="https://t.me/+wPCQ7VwKtq84Mzlk" target="_blank" rel="noreferrer">
+                <span aria-hidden="true">➤</span>
+                الانضمام إلى مجتمع تلجرام
+              </a>
+              <a href="https://sites.google.com/view/dti-sy/" target="_blank" rel="noreferrer">
+                <span aria-hidden="true">↗</span>
+                موقع المعهد
+              </a>
+              <a href="https://www.facebook.com/share/19sB3tbR4T/" target="_blank" rel="noreferrer">
+                <span aria-hidden="true">f</span>
+                صفحة المعهد على فيسبوك
+              </a>
+            </div>
+          </section>
+
           <div className="student-class-manager" style={{ marginTop: 24, padding: '20px 24px', background: '#f8fafc', borderRadius: 16, border: '1px solid #e2e8f0' }}>
             <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 16 }}>
               <h3 className="class-change-title" style={{ margin: 0, fontSize: 18, color: '#0f172a' }}>تغيير الفئة</h3>
@@ -2367,17 +2580,17 @@ export default function Home() {
                   <div>
                     <h2 style={{ margin: '0 0 8px' }}>تسجيل الحضور</h2>
                     <p style={{ margin: 0, color: '#475569', lineHeight: 1.8 }}>
-                      ابدأ الاستماع واسمح باستخدام الميكروفون، ثم أبقِ هذه الصفحة مفتوحة قرب جهاز المشرف. إذا لم يلتقط هاتفك الإشارة، امسح QR المعروض في جلسة الحضور.
+                      اضغط على «تسجيل الحضور» واسمح باستخدام الميكروفون، ثم اقترب من هاتف المشرف.
                     </p>
                   </div>
                   <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                     {!attendanceListening ? (
                       <button type="button" className="action-button primary" onClick={() => void startAttendanceListening()} disabled={attendanceCheckInBusy}>
-                        الاستماع للموجة فوق الصوتية
+                        تسجيل الحضور
                       </button>
                     ) : (
-                      <button type="button" className="action-button" onClick={() => attendanceListenerCleanupRef.current?.()}>
-                        إيقاف الاستماع
+                      <button type="button" className="action-button" onClick={() => attendanceListenerCleanupRef.current?.()} disabled={attendanceCheckInBusy}>
+                        إيقاف التسجيل
                       </button>
                     )}
                     <button
@@ -2389,10 +2602,25 @@ export default function Home() {
                       مسح QR بديل
                     </button>
                   </div>
+                  {attendanceListening && (
+                    <div className="attendance-signal-meter" role="img" aria-label="مؤشر قراءة الإشارة">
+                      <div className="attendance-signal-bars" aria-hidden="true">
+                        {Array.from({ length: 19 }, (_, index) => {
+                          const shape = 0.22 + (Math.sin((index + 1) * 1.7) + 1) * 0.22;
+                          const height = 8 + attendanceSignalLevel * shape * 92;
+                          return (
+                            <span
+                              className={`is-reading${attendanceSignalLevel > 0.7 ? ' is-strong' : ''}`}
+                              key={index}
+                              style={{ animationDelay: `${index * 35}ms`, height: `${height}px` }}
+                            />
+                          );
+                        })}
+                      </div>
+                      <strong>{attendanceSignalLevel >= 0.36 ? 'جاري قراءة الإشارة...' : 'يرجى الاقتراب من هاتف المشرف'}</strong>
+                    </div>
+                  )}
                   {attendanceCheckInStatus && <p role="status" aria-live="polite" style={{ margin: 0, color: '#0f172a' }}>{attendanceCheckInStatus}</p>}
-                  <small style={{ color: '#64748b', lineHeight: 1.7 }}>
-                    يتطلب الصوت إذن الميكروفون واتصالًا بالإنترنت. لا تُسجّل الصفحة صوتًا؛ يُستخدم تحليل محلي لاكتشاف النغمة فقط. قد لا تدعم بعض الأجهزة التردد العالي، لذلك يتوفر QR كبديل.
-                  </small>
                 </section>
                 {attendanceQrScannerOpen && (
                   <div className="attendance-qr-scanner-backdrop">
@@ -2411,6 +2639,18 @@ export default function Home() {
                     </section>
                   </div>
                 )}
+              </div>
+            )}
+
+            {activeTab === 'chat' && studentChatAvailable && (
+              <div className="tab-content active">
+                <StudentChat
+                  studentId={studentChatStudentId}
+                  password={studentChatPassword}
+                  studentYear={studentChatYear}
+                  selectedMessageId={selectedChatMessageId}
+                  onIncomingMessage={playIncomingChatSound}
+                />
               </div>
             )}
 
@@ -2469,6 +2709,7 @@ export default function Home() {
                           <strong>{normalizeText(getValueByKeys(warning, ['نوع الإنذار']))}</strong>
                           <span className="warning-type">{normalizeText(getValueByKeys(warning, ['السبب']))}</span>
                         </div>
+                        <div className="warning-reason">التاريخ: {formatDate(String(getValueByKeys(warning, ['التاريخ', 'created_at']) ?? ''))}</div>
                         <div className="warning-reason">{normalizeText(getValueByKeys(warning, ['التفاصيل']))}</div>
                       </div>
                     ))}

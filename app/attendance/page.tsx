@@ -9,6 +9,7 @@ import { supabase } from '../../lib/supabase';
 import { writeAuditLog } from '../../lib/auditLog';
 import { getClassAvailabilityOptions } from '../../lib/studentData';
 import { buildStudentTelegramMessage, sendTelegramNotification } from '../../lib/telegram';
+import SupervisorChatManagement from '../components/SupervisorChatManagement';
 
 type StudentRow = {
   id?: number | string;
@@ -40,7 +41,7 @@ type StudentRow = {
 
 type AttendanceStatus = 'pending' | 'present' | 'absent';
 type AbsenceReason = 'غياب مبرر' | 'غياب غير مبرر';
-type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile' | 'teacher_accounts' | 'teacher_management' | 'class_schedule' | 'feedback';
+type SupervisorFeature = 'attendance' | 'admin' | 'supervisors' | 'logs' | 'students' | 'create_student' | 'profile' | 'teacher_accounts' | 'teacher_management' | 'class_schedule' | 'feedback' | 'chat';
 type StudentFeedback = {
   id: string;
   kind: 'complaint' | 'suggestion';
@@ -86,7 +87,10 @@ type PendingAttendanceJob = {
   absenceReason?: AbsenceReason | '';
   supervisor: string;
   queuedAt: string;
+  sessionId?: string;
 };
+
+let pendingAttendanceFlushInProgress = false;
 
 const normalizeAbsenceReason = (value?: string | null): AbsenceReason => {
   const reason = normalizeText(value).trim();
@@ -99,6 +103,9 @@ type RecentAttendanceSession = {
   classValue: string;
   supervisor: string;
   startedAt: string;
+  endedAt: string;
+  studentYear: string;
+  status: string;
 };
 
 type SupervisorRow = {
@@ -188,6 +195,7 @@ const auditActionLabels: Record<string, string> = {
   supervisor_deleted: 'حذف حساب مشرف',
   attendance_session_started: 'بدء جلسة حضور',
   attendance_session_saved: 'حفظ جلسة الحضور',
+  attendance_session_deleted: 'حذف جلسة حضور كاملة',
   attendance_status_selected: 'تحديد حالة حضور طالب',
   attendance_updated: 'تعديل سجل حضور',
   attendance_deleted: 'حذف سجل حضور',
@@ -264,7 +272,7 @@ const getSupervisorFeatures = (degree: string): SupervisorFeature[] => {
   const lowerDegree = normalizeText(degree).replace(/\s+/g, '').toLowerCase();
 
   if (normalizedDegree === '1' || ['moderator', 'مودرييتور', 'monitor', 'مراقب', 'المودرييتور'].includes(lowerDegree)) {
-    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'create_student', 'profile', 'teacher_accounts', 'teacher_management', 'class_schedule', 'feedback'];
+    return ['admin', 'attendance', 'supervisors', 'logs', 'students', 'create_student', 'profile', 'teacher_accounts', 'teacher_management', 'class_schedule', 'feedback', 'chat'];
   }
 
   if (normalizedDegree === '2' || ['supervisor', 'سوبر', 'سوبرفايزور', 'super', 'supervisor2', 'fayzor', 'fayzur', 'فايزور', 'faizur'].includes(lowerDegree)) {
@@ -380,26 +388,39 @@ const loadAuditLogs = async (username: string, password: string) => {
 };
 
 const insertAdminAttendance = async (warning: AdminRecord, supervisor: string) => {
+  const attendanceDate = new Date().toISOString().split('T')[0];
   const payload = {
     'الرقم الجامعي': getAdminRecordValue(warning, ['الرقم الجامعي', 'student_id', 'studentId']),
     'اسم الطالب': getAdminRecordValue(warning, ['اسم الطالب', 'student_name', 'name']),
     'المادة': getAdminRecordCourse(warning),
     'الفئة': getAdminRecordValue(warning, ['الفئة', 'class', 'class_name']),
     'الحالة': 'حاضر',
-    'التاريخ': new Date().toISOString(),
+    'التاريخ': attendanceDate,
     'الوقت': new Date().toLocaleTimeString('en-GB', { hour12: false }),
     'المشرف': supervisor || 'مشرف الدرجة الأولى',
   };
 
-  const firstAttempt = await supabase.from('الحضور').insert([payload]);
-  if (!firstAttempt.error) return { success: true };
-  if (!String(firstAttempt.error.message || '').toLowerCase().includes('column')) {
-    return { success: false, error: firstAttempt.error.message };
+  const existing = await supabase.from('الحضور')
+    .select('*')
+    .eq('الرقم الجامعي', payload['الرقم الجامعي'])
+    .eq('المادة', payload['المادة'])
+    .eq('الفئة', payload['الفئة'])
+    .eq('التاريخ', attendanceDate);
+  if (!existing.error && (existing.data ?? []).some((row) => {
+    const record = row as AdminRecord;
+    return String(getAdminRecordValue(record, ['الحالة', 'status'])) === 'حاضر';
+  })) return { success: true };
+  if (existing.error) {
+    console.warn('[attendance][admin] existing attendance lookup failed; insert will still be attempted', {
+      studentId: payload['الرقم الجامعي'],
+      course: payload['المادة'],
+      error: existing.error.message,
+    });
   }
 
-  const { 'الحالة': _status, ...legacyPayload } = payload;
-  const fallbackAttempt = await supabase.from('الحضور').insert([legacyPayload]);
-  return fallbackAttempt.error ? { success: false, error: fallbackAttempt.error.message } : { success: true };
+  const firstAttempt = await supabase.from('الحضور').insert([payload]);
+  if (!firstAttempt.error) return { success: true };
+  return { success: false, error: firstAttempt.error.message };
 };
 
 const deleteAdminWarning = async (warning: AdminRecord) => {
@@ -433,7 +454,7 @@ const updateAdminAttendance = async (record: AdminRecord, status: 'حاضر' | '
   if (!recordId) return { success: false, error: 'لا يوجد معرف لسجل الحضور' };
   const idKey = adminIdCandidates.find((candidate) => String(record[candidate] ?? '') === recordId) ?? 'id';
   const updates: AdminRecord = {};
-  if (record['الحالة'] !== undefined) updates['الحالة'] = status;
+  updates['الحالة'] = status;
   if (record['تفاصيل الغياب'] !== undefined) updates['تفاصيل الغياب'] = absenceDetails;
   else if (record['التفاصيل'] !== undefined) updates['التفاصيل'] = absenceDetails;
   else if (record['ملاحظة'] !== undefined) updates['ملاحظة'] = absenceDetails;
@@ -694,9 +715,19 @@ const writePendingAttendanceJobs = (jobs: PendingAttendanceJob[]) => {
   window.localStorage.setItem(pendingAttendanceStorageKey, JSON.stringify(jobs));
 };
 
+const getAttendanceJobKey = (job: PendingAttendanceJob) => [
+  job.type,
+  job.sessionId ?? '',
+  getStudentIdentifier(job.student),
+  normalizeText(job.course).trim(),
+  normalizeClassValue(job.classValue),
+  job.queuedAt.slice(0, 10),
+].join('|');
+
 const enqueueAttendanceJobs = (jobs: PendingAttendanceJob[]) => {
-  const existingJobs = readPendingAttendanceJobs();
-  writePendingAttendanceJobs([...existingJobs, ...jobs]);
+  const uniqueJobs = new Map<string, PendingAttendanceJob>();
+  [...readPendingAttendanceJobs(), ...jobs].forEach((job) => uniqueJobs.set(getAttendanceJobKey(job), job));
+  writePendingAttendanceJobs([...uniqueJobs.values()]);
 };
 
 const getStudentCacheKey = (classValue: string, year: string) => `${studentCacheStorageKey}:${classValue}:${year}`;
@@ -726,8 +757,11 @@ const normalizeSessionRow = (row: Record<string, unknown>): RecentAttendanceSess
   const classValue = String(row['الفئة'] ?? row['class'] ?? '').trim();
   const supervisor = String(row['المشرف'] ?? row['supervisor'] ?? '').trim();
   const startedAt = String(row['بدأت في'] ?? row['started_at'] ?? row['التاريخ'] ?? '').trim();
+  const endedAt = String(row.ended_at ?? row['انتهت في'] ?? '').trim();
+  const studentYear = String(row.student_year ?? '').trim();
+  const status = String(row['الحالة'] ?? row.status ?? '').trim();
   if (!id || !course || !classValue || !startedAt) return null;
-  return { id, course, classValue, supervisor, startedAt };
+  return { id, course, classValue, supervisor, startedAt, endedAt, studentYear, status };
 };
 
 const isMissingSessionTableError = (error: { code?: string; message?: string } | null | undefined) => {
@@ -771,6 +805,9 @@ const createAttendanceSession = async (course: string, classValue: string, super
     classValue,
     supervisor: supervisor || 'مشرف غير محدد',
     startedAt: new Date().toISOString(),
+    endedAt: '',
+    studentYear: year,
+    status: 'نشطة',
   };
 
   await closeExpiredAttendanceSessions();
@@ -875,7 +912,7 @@ const fetchStudentsByClass = async (selectedClass: string, selectedYear: string)
   return [] as StudentRow[];
 };
 
-const saveWarningRecord = async (student: StudentRow, course: string, classValue: string, status: 'absent' | 'present', supervisor: string, absenceReason?: AbsenceReason | '', warningDateOverride?: string) => {
+const saveWarningRecord = async (student: StudentRow, course: string, classValue: string, status: 'absent' | 'present', supervisor: string, absenceReason?: AbsenceReason | '', warningDateOverride?: string, sessionId?: string) => {
   const studentId = getStudentIdentifier(student);
   if (!studentId) {
     console.warn('[attendance][warning] student id missing before insert', { student, course, classValue, status });
@@ -896,6 +933,24 @@ const saveWarningRecord = async (student: StudentRow, course: string, classValue
   const reasonText = status === 'absent' ? `غياب في مادة ${courseName}` : `حضور في مادة ${courseName}`;
   const detailsText = status === 'absent' ? finalReason : '';
 
+  const existingWarnings = await supabase.from('الإنذارات')
+    .select('*')
+    .eq('الرقم الجامعي', studentId)
+    .eq('التاريخ', warningDate);
+  if (!existingWarnings.error && (existingWarnings.data ?? []).some((row) => {
+    const record = row as Record<string, unknown>;
+    return String(record['السبب'] ?? '') === reasonText
+      && String(record['التفاصيل'] ?? '') === detailsText
+      && (!sessionId || String(record.session_id ?? '') === sessionId);
+  })) return true;
+  if (existingWarnings.error) {
+    console.warn('[attendance][warning] existing warning lookup failed; insert will still be attempted', {
+      studentId,
+      course,
+      error: existingWarnings.error.message,
+    });
+  }
+
   const baseRecord = stripAutoGeneratedWarningIds({
     'الرقم الجامعي': studentId,
     'اسم الطالب': getFullStudentName(student),
@@ -906,6 +961,7 @@ const saveWarningRecord = async (student: StudentRow, course: string, classValue
     'الوقت': warningTime,
     'المشرف': supervisor || 'مشرف غير محدد',
     'تم الإرسال': true,
+    ...(sessionId ? { session_id: sessionId } : {}),
   });
 
   const payloadVariants = [baseRecord, { ...baseRecord, 'الوقت': undefined, 'المشرف': undefined }];
@@ -946,7 +1002,7 @@ const saveWarningRecord = async (student: StudentRow, course: string, classValue
   return false;
 };
 
-const saveAttendanceRecord = async (student: StudentRow, course: string, classValue: string, status: AttendanceStatus, supervisor: string, absenceReason?: AbsenceReason | '') => {
+const saveAttendanceRecord = async (student: StudentRow, course: string, classValue: string, status: AttendanceStatus, supervisor: string, absenceReason?: AbsenceReason | '', attendanceDateOverride?: string, sessionId?: string) => {
   const studentId = getStudentIdentifier(student);
   if (!studentId) {
     console.warn('[attendance][save] student id missing before insert', { student, course, classValue, status });
@@ -958,7 +1014,9 @@ const saveAttendanceRecord = async (student: StudentRow, course: string, classVa
     return false;
   }
 
-  const attendanceDate = new Date().toISOString().split('T')[0];
+  const attendanceDate = attendanceDateOverride?.trim()
+    ? attendanceDateOverride.trim().slice(0, 10)
+    : new Date().toISOString().split('T')[0];
   const attendanceTime = new Date().toLocaleTimeString('en-GB', { hour12: false });
 
   const finalAbsenceReason = status === 'absent' ? normalizeAbsenceReason(absenceReason) : '';
@@ -971,14 +1029,57 @@ const saveAttendanceRecord = async (student: StudentRow, course: string, classVa
     'الفئة': classValue,
     'الحالة': status === 'present' ? 'حاضر' : status === 'absent' ? 'غائب' : 'بانتظار',
     'المشرف': supervisor || 'مشرف غير محدد',
+    ...(sessionId ? { session_id: sessionId } : {}),
     ...(status === 'absent' ? { 'تفاصيل الغياب': finalAbsenceReason, 'التفاصيل': finalAbsenceReason } : {}),
   };
 
-  const payloadVariants = [
-    baseRecord,
-    { ...baseRecord, 'الحالة': undefined },
-    { ...baseRecord, 'الحالة': undefined, 'المشرف': undefined },
-  ];
+  let existingRecordsQuery = supabase.from('الحضور')
+    .select('*')
+    .eq('الرقم الجامعي', studentId)
+    .eq('المادة', course)
+    .eq('الفئة', classValue)
+    .eq('التاريخ', attendanceDate);
+  if (sessionId) existingRecordsQuery = existingRecordsQuery.eq('session_id', sessionId);
+  const existingRecords = await existingRecordsQuery;
+  if (!existingRecords.error) {
+    const currentStatus = baseRecord['الحالة'];
+    const existing = (existingRecords.data ?? []).find((row) => {
+      const record = row as Record<string, unknown>;
+      return String(record['الحالة'] ?? record.status ?? '').trim() === currentStatus;
+    });
+    if (existing) return true;
+
+    const conflictingRecord = existingRecords.data?.[0] as Record<string, unknown> | undefined;
+    if (conflictingRecord && (conflictingRecord['الحالة'] !== undefined || conflictingRecord.status !== undefined)) {
+      let updateQuery = supabase.from('الحضور')
+        .update({
+          'الحالة': currentStatus,
+          'الوقت': attendanceTime,
+          'المشرف': supervisor || 'مشرف غير محدد',
+          ...(sessionId ? { session_id: sessionId } : {}),
+          'تفاصيل الغياب': status === 'absent' ? finalAbsenceReason : null,
+          'التفاصيل': status === 'absent' ? finalAbsenceReason : null,
+        })
+        .eq('الرقم الجامعي', studentId)
+        .eq('المادة', course)
+        .eq('الفئة', classValue)
+        .eq('التاريخ', attendanceDate);
+      if (sessionId) updateQuery = updateQuery.eq('session_id', sessionId);
+      const { error } = await updateQuery;
+      if (!error) return true;
+      console.error('[attendance][save] existing record update failed', { studentId, course, classValue, error: error.message });
+      return false;
+    }
+  } else if (!isDatabaseTableMissing(existingRecords.error)) {
+    console.warn('[attendance][save] existing attendance lookup failed; insert will still be attempted', {
+      studentId,
+      course,
+      classValue,
+      error: existingRecords.error.message,
+    });
+  }
+
+  const payloadVariants = [baseRecord, { ...baseRecord, 'المشرف': undefined }];
 
   for (const tableName of tableCandidates.attendance) {
     for (const payload of payloadVariants) {
@@ -1018,25 +1119,35 @@ const saveAttendanceRecord = async (student: StudentRow, course: string, classVa
 
 const savePendingAttendanceJob = async (job: PendingAttendanceJob) => {
   if (job.type === 'warning') {
-    return saveWarningRecord(job.student, job.course, job.classValue, 'absent', job.supervisor, job.absenceReason);
+    return saveWarningRecord(job.student, job.course, job.classValue, 'absent', job.supervisor, job.absenceReason, job.queuedAt.slice(0, 10), job.sessionId);
   }
 
-  return saveAttendanceRecord(job.student, job.course, job.classValue, job.status, job.supervisor, job.absenceReason);
+  return saveAttendanceRecord(job.student, job.course, job.classValue, job.status, job.supervisor, job.absenceReason, job.queuedAt.slice(0, 10), job.sessionId);
 };
 
 const flushPendingAttendanceJobs = async () => {
-  if (typeof navigator !== 'undefined' && !navigator.onLine) return 0;
+  if (pendingAttendanceFlushInProgress || (typeof navigator !== 'undefined' && !navigator.onLine)) return 0;
 
-  const jobs = readPendingAttendanceJobs();
+  const jobs = [...new Map(readPendingAttendanceJobs().map((job) => [getAttendanceJobKey(job), job])).values()];
   if (!jobs.length) return 0;
 
-  const results = await Promise.all(jobs.map(async (job) => ({
-    job,
-    saved: await savePendingAttendanceJob(job),
-  })));
-  const remainingJobs = results.filter((result) => !result.saved).map((result) => result.job);
-  writePendingAttendanceJobs(remainingJobs);
-  return jobs.length - remainingJobs.length;
+  pendingAttendanceFlushInProgress = true;
+  try {
+    const results = await Promise.all(jobs.map(async (job) => ({
+      job,
+      saved: await savePendingAttendanceJob(job),
+    })));
+    const failedKeys = new Set(results.filter((result) => !result.saved).map((result) => getAttendanceJobKey(result.job)));
+    const initialKeys = new Set(jobs.map(getAttendanceJobKey));
+    const latestJobs = readPendingAttendanceJobs();
+    const remainingJobs = latestJobs.filter((job) => (
+      failedKeys.has(getAttendanceJobKey(job)) || !initialKeys.has(getAttendanceJobKey(job))
+    ));
+    writePendingAttendanceJobs([...new Map(remainingJobs.map((job) => [getAttendanceJobKey(job), job])).values()]);
+    return results.filter((result) => result.saved).length;
+  } finally {
+    pendingAttendanceFlushInProgress = false;
+  }
 };
 
 export default function AttendancePage() {
@@ -1291,7 +1402,7 @@ export default function AttendancePage() {
         setAttendanceData((current) => {
           const next = { ...current };
           presentByStudent.forEach((timestamp, studentId) => {
-            if (next[studentId]?.status !== 'pending') return;
+            if (next[studentId]?.status !== 'pending' && next[studentId]?.status !== 'absent') return;
             const student = students.find((row) => getStudentIdentifier(row) === studentId);
             if (!student) return;
             next[studentId] = {
@@ -1339,6 +1450,51 @@ export default function AttendancePage() {
       setRecentSessions(await loadRecentAttendanceSessions());
     } catch (error) {
       console.error('Recent attendance sessions load failed:', getSupabaseErrorText(error));
+    }
+  };
+
+  const deleteAttendanceSession = async (session: RecentAttendanceSession) => {
+    if (supervisorDegree !== '1' || session.status === 'نشطة') return;
+    const confirmed = window.confirm(
+      `هل تريد حذف جلسة ${session.course} للفئة ${session.classValue} نهائياً؟ سيتم حذف سجلات الحضور والغياب وإنذارات الغياب المرتبطة بهذه الجلسة فقط. السجلات القديمة غير المرتبطة بمعرّف الجلسة لن تُحذف.`
+    );
+    if (!confirmed) return;
+
+    setLoading(true);
+    try {
+      const response = await fetch('/api/supervisor/attendance-session', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: session.id,
+          username: supervisorUsername,
+          password: supervisorPassword,
+        }),
+      });
+      const result = await response.json() as { success?: boolean; error?: string; deletedAttendance?: number; deletedWarnings?: number };
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'تعذر حذف جلسة الحضور');
+      }
+
+      writeAuditLog({
+        action: 'attendance_session_deleted',
+        userType: 'supervisor',
+        username: supervisorUsername,
+        details: {
+          sessionId: session.id,
+          course: session.course,
+          classValue: session.classValue,
+          deletedAttendance: result.deletedAttendance ?? 0,
+          deletedWarnings: result.deletedWarnings ?? 0,
+        },
+      });
+      setNotice(`تم حذف الجلسة وسجلاتها المرتبطة: ${result.deletedAttendance ?? 0} سجل حضور و${result.deletedWarnings ?? 0} إنذار.`);
+      await Promise.all([refreshRecentSessions(), refreshAdminData()]);
+    } catch (error) {
+      console.error('Attendance session deletion failed:', getSupabaseErrorText(error));
+      setNotice(`تعذر حذف الجلسة: ${getSupabaseErrorText(error)}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -2999,7 +3155,7 @@ export default function AttendancePage() {
   };
 
   const saveSession = async () => {
-    if (saveInProgressRef.current || loading) return;
+    if (saveInProgressRef.current || loading || pendingAttendanceFlushInProgress) return;
     const pendingStudents = students.filter((student) => {
       const studentId = getStudentIdentifier(student);
       return attendanceData[studentId]?.status !== 'present' && attendanceData[studentId]?.status !== 'absent';
@@ -3011,6 +3167,7 @@ export default function AttendancePage() {
     }
 
     saveInProgressRef.current = true;
+    pendingAttendanceFlushInProgress = true;
     const attendanceKeys = Object.keys(attendanceData);
 
     console.log('[attendance][saveSession] begin save', {
@@ -3030,6 +3187,7 @@ export default function AttendancePage() {
       });
       setNotice('لا توجد بيانات للحضور لحفظها؛ حالة الحضور فارغة أو لا تحتوي على أرقام الطلاب');
       saveInProgressRef.current = false;
+      pendingAttendanceFlushInProgress = false;
       return;
     }
 
@@ -3065,6 +3223,7 @@ export default function AttendancePage() {
           absenceReason: entry.absenceReason || 'غياب مبرر',
           supervisor: supervisorUsername,
           queuedAt: new Date().toISOString(),
+          sessionId: activeSession?.id,
         });
 
         if (status === 'absent') {
@@ -3077,6 +3236,7 @@ export default function AttendancePage() {
             absenceReason: entry.absenceReason || 'غياب مبرر',
             supervisor: supervisorUsername,
             queuedAt: new Date().toISOString(),
+            sessionId: activeSession?.id,
           });
         }
       }
@@ -3120,6 +3280,7 @@ export default function AttendancePage() {
       setNotice('حدث خطأ أثناء حفظ بيانات الحضور');
     } finally {
       saveInProgressRef.current = false;
+      pendingAttendanceFlushInProgress = false;
       setLoading(false);
     }
   };
@@ -3331,6 +3492,25 @@ export default function AttendancePage() {
                   <span className="feature-arrow" aria-hidden="true">←</span>
                 </button>
               )}
+              {supervisorFeatures.includes('chat') && (
+                <button
+                  type="button"
+                  className="supervisor-feature-card"
+                  onClick={() => {
+                    setSelectedFeature('chat');
+                    const stored = JSON.parse(window.localStorage.getItem(supervisorSessionStorageKey) || '{}') as StoredSupervisorSession;
+                    window.localStorage.setItem(supervisorSessionStorageKey, JSON.stringify({ ...stored, selectedFeature: 'chat' }));
+                    writeAuditLog({ action: 'feature_opened', userType: 'supervisor', username: supervisorUsername, details: { feature: 'chat' } });
+                  }}
+                >
+                  <span className="feature-icon" aria-hidden="true">☷</span>
+                  <span>
+                    <strong>دردشة الطلاب</strong>
+                    <small>فتح الدردشة أو إغلاقها وإدارة حظر الطلاب</small>
+                  </span>
+                  <span className="feature-arrow" aria-hidden="true">←</span>
+                </button>
+              )}
               {supervisorFeatures.includes('attendance') && (
                 <button
                   type="button"
@@ -3522,6 +3702,13 @@ export default function AttendancePage() {
               <div className="loading-box">لا توجد شكاوى أو اقتراحات مسجلة.</div>
             ) : null}
           </section>
+        )}
+
+        {supervisorLoggedIn && supervisorFeatures.includes('chat') && selectedFeature === 'chat' && (
+          <SupervisorChatManagement
+            supervisorUsername={supervisorUsername}
+            supervisorPassword={supervisorPassword}
+          />
         )}
 
         {supervisorLoggedIn && selectedFeature === 'teacher_accounts' && (
@@ -3950,7 +4137,7 @@ export default function AttendancePage() {
                       <div className={`admin-record-item admin-record-selectable ${selectedAdminAttendanceKey === `${getAdminRecordId(record)}-${index}` ? 'selected' : ''}`} key={`${getAdminRecordId(record)}-${index}`} onClick={() => setSelectedAdminAttendanceKey(`${getAdminRecordId(record)}-${index}`)}>
                         <strong>{getAdminRecordCourse(record) || 'مادة غير محددة'}</strong>
                         <span>{getAdminRecordDate(record)} - {String(getAdminRecordValue(record, ['الوقت', 'time']) || '')}</span>
-                        <span>{String(getAdminRecordValue(record, ['الحالة', 'status']) || 'غير محدد')}</span><span>المشرف: {getAdminRecordSupervisor(record)}</span><span>{String(getAdminRecordValue(record, ['الوقت', 'time']) || '')}</span>
+                        <span>الحالة: {String(getAdminRecordValue(record, ['الحالة', 'status']) || 'غير محدد')}</span><span>المشرف: {getAdminRecordSupervisor(record)}</span>
                         <button type="button" onClick={(event) => { event.stopPropagation(); setSelectedAdminAttendanceKey(`${getAdminRecordId(record)}-${index}`); }}>التعديلات</button>
                         {getAdminRecordValue(record, ['الحالة', 'status']) !== undefined && selectedAdminAttendanceKey === `${getAdminRecordId(record)}-${index}` && <div className="admin-record-actions"><button type="button" onClick={() => void handleAttendanceToWarning(record)}>تحويل لإنذار غياب</button><button type="button" className="danger" onClick={() => void handleDeleteAttendance(record)}>حذف الحضور</button></div>}
                       </div>
@@ -3973,7 +4160,7 @@ export default function AttendancePage() {
             )}
 
             {(adminRecordType === 'all' || adminRecordType === 'attendance') && (
-              <div className="admin-table-section"><h2>آخر سجلات الحضور</h2><div className="admin-record-list">{filteredAdminAttendance.slice(0, 50).map((record, index) => <div className="admin-record-item" key={`${getAdminRecordId(record)}-${index}`}><strong>{getAdminStudentName(record)}</strong><span>{String(getAdminRecordValue(record, ['الرقم الجامعي', 'student_id', 'studentId']))}</span><span>{getAdminRecordCourse(record)} - {getAdminRecordDate(record)}</span><span>المشرف: {getAdminRecordSupervisor(record)} - {String(getAdminRecordValue(record, ['الوقت', 'time']) || '')}</span><button type="button" onClick={() => setSelectedAdminStudentId(String(getAdminRecordValue(record, ['الرقم الجامعي', 'student_id', 'studentId'])))}>تفاصيل الطالب</button></div>)}</div></div>
+              <div className="admin-table-section"><h2>آخر سجلات الحضور</h2><div className="admin-record-list">{filteredAdminAttendance.slice(0, 50).map((record, index) => <div className="admin-record-item" key={`${getAdminRecordId(record)}-${index}`}><strong>{getAdminStudentName(record)}</strong><span>{String(getAdminRecordValue(record, ['الرقم الجامعي', 'student_id', 'studentId']))}</span><span>{getAdminRecordCourse(record)} - {getAdminRecordDate(record)}</span><span>الحالة: {String(getAdminRecordValue(record, ['الحالة', 'status']) || 'غير محدد')}</span><span>المشرف: {getAdminRecordSupervisor(record)} - {String(getAdminRecordValue(record, ['الوقت', 'time']) || '')}</span><button type="button" onClick={() => setSelectedAdminStudentId(String(getAdminRecordValue(record, ['الرقم الجامعي', 'student_id', 'studentId'])))}>تفاصيل الطالب</button></div>)}</div></div>
             )}
 
             {(adminRecordType === 'all' || adminRecordType === 'warnings') && (
@@ -4385,8 +4572,20 @@ export default function AttendancePage() {
               ) : (
                 <div style={{ marginTop: 8 }}>
                   {recentSessions.map((session) => (
-                    <div key={session.id} style={{ marginTop: 6 }}>
-                      {session.course} - الفئة {session.classValue} - {session.supervisor} - {new Date(session.startedAt).toLocaleTimeString('ar-EG')}
+                    <div key={session.id} style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                      <span>
+                        {session.course} - الفئة {session.classValue} - {session.supervisor} - {new Date(session.startedAt).toLocaleTimeString('ar-EG')}
+                      </span>
+                      {supervisorDegree === '1' && session.status !== 'نشطة' && session.endedAt && (
+                        <button
+                          className="action-button danger"
+                          type="button"
+                          onClick={() => void deleteAttendanceSession(session)}
+                          disabled={loading}
+                        >
+                          حذف الجلسة كاملة
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -4463,10 +4662,17 @@ export default function AttendancePage() {
                     }
                   }}
                 >
-                  <option value={17000}>17 كيلوهرتز</option>
-                  <option value={18000}>18 كيلوهرتز</option>
-                  <option value={19000}>19 كيلوهرتز</option>
-                  <option value={20000}>20 كيلوهرتز</option>
+                  <optgroup label="نغمات مسموعة - مدى أوضح غالبًا">
+                    <option value={1000}>1000 هرتز</option>
+                    <option value={1500}>1500 هرتز</option>
+                    <option value={2000}>2000 هرتز</option>
+                  </optgroup>
+                  <optgroup label="نغمات عالية">
+                    <option value={17000}>17 كيلوهرتز</option>
+                    <option value={18000}>18 كيلوهرتز</option>
+                    <option value={19000}>19 كيلوهرتز</option>
+                    <option value={20000}>20 كيلوهرتز</option>
+                  </optgroup>
                 </select>
               </label>
               {!audioChallengeBusy ? (
@@ -4483,6 +4689,9 @@ export default function AttendancePage() {
               </button>
               {audioChallengeStatus && <span className="session-info" style={{ margin: 0 }}>{audioChallengeStatus}</span>}
             </div>
+            <p style={{ marginTop: -8, marginBottom: 18, color: '#64748b', fontSize: 13 }}>
+              النغمات المسموعة قد تصل أبعد بحسب مكبر الصوت والضوضاء، لكنها ستكون مسموعة للطلاب. أبقِ مستوى الصوت معتدلًا واستخدم QR عند الحاجة.
+            </p>
 
             {showAttendanceChallengeQr && attendanceChallengeQr && (
               <div className="attendance-qr-scanner-backdrop" onClick={() => setShowAttendanceChallengeQr(false)}>

@@ -79,6 +79,11 @@ const getStudentName = (student: Record<string, unknown>) => [
 const getStudentYear = (student: Record<string, unknown>) => normalizeYear(
   student['السنه الدراسية'] ?? student['السنة الدراسية'] ?? student.year ?? student.student_year
 );
+const attendanceKey = (studentId: string, subject: string, date: string) => [
+  studentId,
+  normalized(subject),
+  date.slice(0, 10),
+].join('|');
 
 export async function POST(request: Request) {
   const supabase = createSupabaseAdminClient();
@@ -215,15 +220,19 @@ export async function POST(request: Request) {
     }
 
     if (body.action === 'dashboard') {
-      const [studentsResult, attendanceResult, alertsResult] = await Promise.all([
+      const [studentsResult, attendanceResult, warningsResult, alertsResult] = await Promise.all([
         supabase.from('students').select('*'),
         supabase.from('الحضور').select('*'),
+        supabase.from('الإنذارات').select('*'),
         supabase.from('teacher_alerts')
           .select('id, student_id, subject, student_year, message, created_at')
           .eq('teacher_id', teacher.id)
           .order('created_at', { ascending: false }),
       ]);
-      if (studentsResult.error || attendanceResult.error || alertsResult.error) {
+      const warningsTableMissing = warningsResult.error
+        && (warningsResult.error.code === 'PGRST205'
+          || /does not exist|relation|not found/i.test(warningsResult.error.message));
+      if (studentsResult.error || attendanceResult.error || alertsResult.error || (warningsResult.error && !warningsTableMissing)) {
         return errorResponse('teacher-dashboard-load-failed', 500);
       }
       const students = (studentsResult.data ?? []).map((row) => {
@@ -238,6 +247,7 @@ export async function POST(request: Request) {
         };
       }).filter((student) => student.id && assignments.some((assignment) => assignment.year === student.year));
       const studentYears = new Map(students.map((student) => [student.id, student.year]));
+      const studentClasses = new Map(students.map((student) => [student.id, student.className]));
       const attendance = (attendanceResult.data ?? []).flatMap((row) => {
         const record = row as Record<string, unknown>;
         const subjectName = clean(record['المادة'] ?? record.course ?? record.subject);
@@ -255,6 +265,36 @@ export async function POST(request: Request) {
           className: clean(record['الفئة'] ?? record.class ?? record.class_name) || 'غير محدد',
         }];
       });
+      const attendanceKeys = new Set(attendance
+        .filter((record) => ['غائب', 'غياب', 'متغيب', 'absent'].includes(normalized(record.status)))
+        .map((record) => attendanceKey(record.studentId, record.subject, record.date)));
+      const absenceWarnings = (warningsResult.data ?? []).flatMap((row) => {
+        const warning = row as Record<string, unknown>;
+        const studentId = clean(warning['الرقم الجامعي'] ?? warning.student_id ?? warning.studentId);
+        const warningType = clean(warning['نوع الإنذار'] ?? warning.type);
+        const reason = clean(warning['السبب'] ?? warning.reason);
+        if (!studentId || (!warningType.includes('غياب') && !/^غياب(?:\s|$)/.test(reason))) return [];
+
+        const reasonCourse = reason.match(/غياب\s+في\s+مادة\s+(.+)$/)?.[1]?.trim() ?? '';
+        const subjectName = clean(warning['المادة'] ?? warning.course ?? warning.subject) || reasonCourse;
+        const year = normalizeYear(studentYears.get(studentId));
+        const assignment = assignments.find((item) => normalized(item.name) === normalized(subjectName) && item.year === year);
+        if (!assignment) return [];
+
+        const date = clean(warning['التاريخ'] ?? warning.date ?? warning.created_at);
+        const subject = assignment.label;
+        if (date && attendanceKeys.has(attendanceKey(studentId, subject, date))) return [];
+        return [{
+          id: `warning-${clean(warning.warnig_id ?? warning.warning_id ?? warning.id) || `${studentId}-${date}-${subject}`}`,
+          studentId,
+          subject,
+          status: 'غائب',
+          date,
+          details: clean(warning['التفاصيل'] ?? warning.details ?? reason),
+          className: clean(warning['الفئة'] ?? warning.class ?? warning.class_name) || studentClasses.get(studentId) || 'غير محدد',
+        }];
+      });
+      attendance.push(...absenceWarnings);
       const alerts = (alertsResult.data ?? []).flatMap((alert) => {
         const year = normalizeYear(alert.student_year);
         const assignment = assignments.find((item) => item.name === clean(alert.subject) && item.year === year);
